@@ -11,6 +11,9 @@ import java.util.Iterator;
  */
 public class Tuple implements Serializable {
 
+    private TupleDesc tupleDesc;
+    private Field[] fields;
+    private RecordId recordId;
     private static final long serialVersionUID = 1L;
 
     /**
@@ -21,15 +24,19 @@ public class Tuple implements Serializable {
      *            instance with at least one field.
      */
     public Tuple(TupleDesc td) {
-        // some code goes here
+        if (td == null) {
+            throw new IllegalArgumentException("TupleDesc cannot be null");
+        }
+        this.tupleDesc = td;
+        // 根据字段数初始化字段数组
+        this.fields = new Field[td.numFields()];
     }
 
     /**
      * @return The TupleDesc representing the schema of this tuple.
      */
     public TupleDesc getTupleDesc() {
-        // some code goes here
-        return null;
+        return this.tupleDesc;
     }
 
     /**
@@ -37,8 +44,7 @@ public class Tuple implements Serializable {
      *         be null.
      */
     public RecordId getRecordId() {
-        // some code goes here
-        return null;
+        return this.recordId;
     }
 
     /**
@@ -48,7 +54,7 @@ public class Tuple implements Serializable {
      *            the new RecordId for this tuple.
      */
     public void setRecordId(RecordId rid) {
-        // some code goes here
+        this.recordId = rid;
     }
 
     /**
@@ -60,7 +66,7 @@ public class Tuple implements Serializable {
      *            new value for the field.
      */
     public void setField(int i, Field f) {
-        // some code goes here
+        this.fields[i] = f;
     }
 
     /**
@@ -70,8 +76,10 @@ public class Tuple implements Serializable {
      *            field index to return. Must be a valid index.
      */
     public Field getField(int i) {
-        // some code goes here
-        return null;
+        if(this.fields[i] == null){
+            return null;
+        }
+        return this.fields[i];
     }
 
     /**
@@ -79,12 +87,19 @@ public class Tuple implements Serializable {
      * system tests, the format needs to be as follows:
      *
      * column1\tcolumn2\tcolumn3\t...\tcolumnN
+     * 此处的column是value of the tuple's fields
      *
      * where \t is any whitespace (except a newline)
      */
     public String toString() {
-        // some code goes here
-        throw new UnsupportedOperationException("Implement this");
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < fields.length; i++){
+            sb.append(fields[i] != null ? fields[i].toString() : "null");
+            if(i < fields.length - 1){
+                sb.append("\t");
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -93,8 +108,8 @@ public class Tuple implements Serializable {
      * */
     public Iterator<Field> fields()
     {
-        // some code goes here
-        return null;
+        // Arrays.asList(fields) creates a List<Field>, .iterator() on that list returns an Iterator<Field>
+        return Arrays.asList(fields).iterator();
     }
 
     /**
@@ -102,6 +117,9 @@ public class Tuple implements Serializable {
      * */
     public void resetTupleDesc(TupleDesc td)
     {
-        // some code goes here
+        if(td == null){
+            throw new IllegalArgumentException("TupleDesc cannot be null");
+        }
+        this.tupleDesc = td;
     }
 }

@@ -27,6 +27,13 @@ public class BufferPool {
     private static final int DEFAULT_PAGE_SIZE = 4096;
 
     private static int pageSize = DEFAULT_PAGE_SIZE;
+
+    private final int maxPages;
+
+    // 为什么前面用Map，这里用ConcurrentHashMap？
+    // 之前的Map是用作接口，makeing code more flexible。
+    // 对于BufferPool这种component来说，may be accessed concurrently by multiple threads，需要线程安全
+    private final ConcurrentHashMap<PageId, Page> pageCache;
     
     /** Default number of pages passed to the constructor. This is used by
     other classes. BufferPool should use the numPages argument to the
@@ -39,7 +46,8 @@ public class BufferPool {
      * @param numPages maximum number of pages in this buffer pool.
      */
     public BufferPool(int numPages) {
-        // some code goes here
+        this.maxPages = numPages;
+        pageCache = new ConcurrentHashMap<>();
     }
     
     public static int getPageSize() {
@@ -57,14 +65,14 @@ public class BufferPool {
     }
 
     /**
-     * Retrieve the specified page with the associated permissions.
+     * Retrieve(取回) the specified page with the associated permissions.
      * Will acquire a lock and may block if that lock is held by another
      * transaction.
      * <p>
      * The retrieved page should be looked up in the buffer pool.  If it
      * is present, it should be returned.  If it is not present, it should
      * be added to the buffer pool and returned.  If there is insufficient
-     * space in the buffer pool, a page should be evicted and the new page
+     * space in the buffer pool, a page should be evicted(驱逐) and the new page
      * should be added in its place.
      *
      * @param tid the ID of the transaction requesting the page
@@ -73,8 +81,26 @@ public class BufferPool {
      */
     public  Page getPage(TransactionId tid, PageId pid, Permissions perm)
         throws TransactionAbortedException, DbException {
-        // some code goes here
-        return null;
+        // If the page is already cached, return it.
+        if (pageCache.containsKey(pid)) {
+            return pageCache.get(pid);
+        }
+
+        // If the buffer pool is full (i.e. number of pages equals maxPages),
+        // throw an exception because no eviction policy is implemented for this lab.
+        if (pageCache.size() >= maxPages) {
+            throw new DbException("Buffer pool is full, no eviction policy implemented.");
+        }
+
+        // Load the page from disk.
+        // Retrieve the DbFile that contains the requested page using the tableId from pid.
+        DbFile dbfile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+        Page page = dbfile.readPage(pid);
+
+        // Cache the newly loaded page.
+        pageCache.put(pid, page);
+
+        return page;
     }
 
     /**

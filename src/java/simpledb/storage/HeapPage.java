@@ -71,9 +71,8 @@ public class HeapPage implements Page {
     /** Retrieve the number of tuples on this page.
         @return the number of tuples on this page
     */
-    private int getNumTuples() {        
-        // some code goes here
-        return 0;
+    private int getNumTuples() {
+        return BufferPool.getPageSize() * 8 / (td.getSize() * 8 + 1);
 
     }
 
@@ -81,11 +80,8 @@ public class HeapPage implements Page {
      * Computes the number of bytes in the header of a page in a HeapFile with each tuple occupying tupleSize bytes
      * @return the number of bytes in the header of a page in a HeapFile with each tuple occupying tupleSize bytes
      */
-    private int getHeaderSize() {        
-        
-        // some code goes here
-        return 0;
-                 
+    private int getHeaderSize() {
+        return (int) Math.ceil(numSlots / 8.0);
     }
     
     /** Return a view of this page before it was modified
@@ -117,12 +113,11 @@ public class HeapPage implements Page {
      * @return the PageId associated with this page.
      */
     public HeapPageId getId() {
-    // some code goes here
-    throw new UnsupportedOperationException("implement this");
+        return pid;
     }
 
     /**
-     * Suck up tuples from the source file.
+     * Suck up(吸收) tuples from the source file.
      */
     private Tuple readNextTuple(DataInputStream dis, int slotId) throws NoSuchElementException {
         // if associated bit is not set, read forward to the next tuple, and
@@ -209,7 +204,7 @@ public class HeapPage implements Page {
             }
         }
 
-        // padding
+        // padding(填充)
         int zerolen = BufferPool.getPageSize() - (header.length + td.getSize() * tuples.length); //- numSlots * td.getSize();
         byte[] zeroes = new byte[zerolen];
         try {
@@ -285,18 +280,30 @@ public class HeapPage implements Page {
 
     /**
      * Returns the number of empty slots on this page.
+     *
      */
     public int getNumEmptySlots() {
-        // some code goes here
-        return 0;
+        int count = 0;
+        for(int i = 0; i < numSlots; i++){
+            if(!(isSlotUsed(i))){
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
      * Returns true if associated slot on this page is filled.
+     * 在 HeapPage 的存储结构中，每个槽（slot）都有一个 位（bit）来表示它的状态：
+     * 1 表示已使用（filled），0 表示未使用（empty），这些位被紧凑地存储在 header 数组中，
+     * 其中 header 是一个字节数组（byte[]），每个字节（8 bit）可以存储8 个槽位的状态
      */
     public boolean isSlotUsed(int i) {
-        // some code goes here
-        return false;
+        int byteIndex = i / 8;  // 确定当前槽位 i 位于 header 数组的哪个字节
+        int bitOffset = i % 8;  // 确定当前槽位 i 在这个字节的哪一位（0-7）
+
+        // 右移 bitOffset 位，使目标位移动到最低位（LSB），然后 & 1 取最低位的值
+        return ((header[byteIndex] >> bitOffset) & 1) == 1;
     }
 
     /**
@@ -312,8 +319,13 @@ public class HeapPage implements Page {
      * (note that this iterator shouldn't return tuples in empty slots!)
      */
     public Iterator<Tuple> iterator() {
-        // some code goes here
-        return null;
+        ArrayList<Tuple> res = new ArrayList<>();
+        for(int i = 0; i < numSlots; i++){
+            if(isSlotUsed(i)){
+                res.add(tuples[i]);
+            }
+        }
+        return res.iterator();
     }
 
 }

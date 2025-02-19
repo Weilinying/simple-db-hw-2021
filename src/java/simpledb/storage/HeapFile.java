@@ -22,15 +22,19 @@ import java.util.*;
  */
 public class HeapFile implements DbFile {
 
+    private final File file;
+
+    private final TupleDesc td;
     /**
      * Constructs a heap file backed by the specified file.
      * 
      * @param f
      *            the file that stores the on-disk backing store for this heap
-     *            file.
+     *            file.（磁盘上实际存储数据的文件，而不是在内存中的临时数据。）
      */
     public HeapFile(File f, TupleDesc td) {
-        // some code goes here
+        this.file = f;
+        this.td = td;
     }
 
     /**
@@ -39,8 +43,7 @@ public class HeapFile implements DbFile {
      * @return the File backing this HeapFile on disk.
      */
     public File getFile() {
-        // some code goes here
-        return null;
+        return file;
     }
 
     /**
@@ -53,8 +56,7 @@ public class HeapFile implements DbFile {
      * @return an ID uniquely identifying this HeapFile.
      */
     public int getId() {
-        // some code goes here
-        throw new UnsupportedOperationException("implement this");
+        return file.getAbsoluteFile().hashCode();
     }
 
     /**
@@ -63,14 +65,29 @@ public class HeapFile implements DbFile {
      * @return TupleDesc of this DbFile.
      */
     public TupleDesc getTupleDesc() {
-        // some code goes here
-        throw new UnsupportedOperationException("implement this");
+        return td;
     }
 
     // see DbFile.java for javadocs
     public Page readPage(PageId pid) {
-        // some code goes here
-        return null;
+        // 1. calculate the correct offset in the file
+        int pageSize = BufferPool.getPageSize();
+        int pageNo = pid.getPageNumber();
+        int offset = pageSize * pageNo;
+
+        byte[] data = new byte[pageSize]; // Buffer to hold the page data
+        // 2. random access to the file
+        try(RandomAccessFile raf = new RandomAccessFile(file, "r")){
+            if(offset > raf.length()){ // raf.length()是文件的总字节数。文件的内容是从 0 到 raf.length() - 1 的位置
+                throw new IllegalArgumentException("Requested page number " + pageNo + " exceeds file length.");
+            }
+            raf.seek(offset); // Move the file pointer to the correct offset
+            raf.readFully(data); // 从文件当前位置开始，读取 data.length 字节的数据，填充 data 数组。
+            return new HeapPage((HeapPageId) pid, data);
+        }catch (IOException e){
+            throw new IllegalArgumentException("Error reading page from file", e);
+        }
+
     }
 
     // see DbFile.java for javadocs
@@ -83,8 +100,7 @@ public class HeapFile implements DbFile {
      * Returns the number of pages in this HeapFile.
      */
     public int numPages() {
-        // some code goes here
-        return 0;
+        return (int) (file.length() / BufferPool.getPageSize());
     }
 
     // see DbFile.java for javadocs
@@ -104,9 +120,63 @@ public class HeapFile implements DbFile {
     }
 
     // see DbFile.java for javadocs
+    // 对HeapFile进行迭代，以便能够一条一条地读取存储在 HeapPage 里的数据，就像 Java 的 Iterator 允许遍历 ArrayList 一样。
     public DbFileIterator iterator(TransactionId tid) {
-        // some code goes here
-        return null;
+        return new DbFileIterator() {
+            private int currentPageIndex = 0;
+            private Iterator<Tuple> tupleIterator; // 当前页的 Tuple 迭代器
+            private boolean open = false; // 标志迭代器是否已打开
+
+            // 辅助方法：获取指定页的 Tuple 迭代器
+            // 找到HeapPage，遍历其中的Tuple
+            private Iterator<Tuple> getTupleIterator(int pageIndex) throws DbException, TransactionAbortedException{
+                if(pageIndex >= numPages()){
+                    return null; // 如果页号超出范围，返回 null
+                }
+                PageId pid = new HeapPageId(getId(), pageIndex);
+                HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_ONLY);
+                return page.iterator();
+            }
+            @Override
+            public void open() throws DbException, TransactionAbortedException {
+                currentPageIndex = 0;
+                tupleIterator = getTupleIterator(currentPageIndex);
+                open = true;
+            }
+
+            @Override
+            public boolean hasNext() throws DbException, TransactionAbortedException {
+                if(!open) return false;
+                if(tupleIterator != null && tupleIterator.hasNext()) return true;
+                while(currentPageIndex < numPages() - 1){
+                    currentPageIndex++;
+                    tupleIterator = getTupleIterator(currentPageIndex);
+                    if(tupleIterator != null && tupleIterator.hasNext()) return true;
+                }
+                return false;
+            }
+
+            @Override
+            public Tuple next() throws DbException, TransactionAbortedException, NoSuchElementException {
+                if (!hasNext()) {
+                    throw new NoSuchElementException("No more tuples");
+                }
+                return tupleIterator.next();
+            }
+
+            @Override
+            public void rewind() throws DbException, TransactionAbortedException {
+                close();
+                open();
+            }
+
+            @Override
+            public void close() {
+                open = false;
+                tupleIterator = null;
+                currentPageIndex = numPages();
+            }
+        };
     }
 
 }
