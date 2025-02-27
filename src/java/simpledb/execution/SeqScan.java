@@ -24,7 +24,7 @@ public class SeqScan implements OpIterator {
     // 有reset函数用来更新 -- changeable
     private final TransactionId tid;
     private int tableid;
-    private String tableAlias;
+    private String tableAlias; // Alias：别名
     private DbFileIterator iterator;
 
 
