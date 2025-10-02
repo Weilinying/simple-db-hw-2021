@@ -71,12 +71,14 @@ public class HeapFile implements DbFile {
     // see DbFile.java for javadocs
     public Page readPage(PageId pid) {
         // 1. calculate the correct offset in the file
+        // 能算出这页数据在文件中从哪一个字节开始
         int pageSize = BufferPool.getPageSize();
         int pageNo = pid.getPageNumber();
         int offset = pageSize * pageNo;
 
         byte[] data = new byte[pageSize]; // Buffer to hold the page data
         // 2. random access to the file
+        // 打开磁盘上的表文件，允许“随机访问”（随时跳到文件的任意位置读写）
         try(RandomAccessFile raf = new RandomAccessFile(file, "r")){
             if(offset > raf.length()){ // raf.length()是文件的总字节数。文件的内容是从 0 到 raf.length() - 1 的位置
                 throw new IllegalArgumentException("Requested page number " + pageNo + " exceeds file length.");
@@ -137,6 +139,7 @@ public class HeapFile implements DbFile {
                 HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_ONLY);
                 return page.iterator();
             }
+            // 定位到第一页，准备开始读
             @Override
             public void open() throws DbException, TransactionAbortedException {
                 currentPageIndex = 0;
@@ -144,10 +147,13 @@ public class HeapFile implements DbFile {
                 open = true;
             }
 
+            // 看还有没有下一条 tuple
             @Override
             public boolean hasNext() throws DbException, TransactionAbortedException {
                 if(!open) return false;
+                // 当前页还有下一条 tuple
                 if(tupleIterator != null && tupleIterator.hasNext()) return true;
+                // 当前页没有了，尝试下一页
                 while(currentPageIndex < numPages() - 1){
                     currentPageIndex++;
                     tupleIterator = getTupleIterator(currentPageIndex);
@@ -156,6 +162,7 @@ public class HeapFile implements DbFile {
                 return false;
             }
 
+            // 拿出下一条 tuple
             @Override
             public Tuple next() throws DbException, TransactionAbortedException, NoSuchElementException {
                 if (!hasNext()) {
@@ -164,12 +171,14 @@ public class HeapFile implements DbFile {
                 return tupleIterator.next();
             }
 
+            // 重新开始
             @Override
             public void rewind() throws DbException, TransactionAbortedException {
                 close();
                 open();
             }
 
+            // 关闭迭代器
             @Override
             public void close() {
                 open = false;

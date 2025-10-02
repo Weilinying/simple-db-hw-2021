@@ -52,7 +52,7 @@ public class HeapPageId implements PageId {
         if(!(o instanceof HeapPageId)) return false;
 
         HeapPageId heapPageId = (HeapPageId) o;
-        return this.tableId == heapPageId.tableId && this.pageNumber == ((HeapPageId) o).pageNumber;
+        return this.tableId == heapPageId.tableId && this.pageNumber == heapPageId.pageNumber;
     }
 
     /**

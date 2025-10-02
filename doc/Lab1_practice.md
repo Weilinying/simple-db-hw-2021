@@ -147,6 +147,14 @@ ant test
 ***
 数据库查询常用映射关系，比如sql：select * from *，用的就是映射关系，Catalog.java作为存储元数据的文件（包含多个数据库对象的schema，需要map来进行对应），构造constructor时根据下面的函数使用到的数据创建不同的映射关系（HashMap）。
 
+关于Catalog的设计:
+1. id -> 文件 table
+2. id -> 文件名 tableName
+3. id -> 主键 field
+4. tableName -> id 
+
+前三个试为了方便查询，第四个是为了方便通过表名查询表id。如果没有tableName -> id (单向映射)，就需要遍历所有的表来找到对应的id，效率低下，时间复杂度是 O(n)。而如果是双向映射，查询表id和用这个id在tables中取出文件或其他信息的时间复杂度都是 O(1)。
+
 
 ## 2.4 BufferPool
 ### Exercise3
@@ -164,6 +172,10 @@ ant test
 | **管理数据页（Pages）** | 维护哪些数据页在内存中，哪些需要替换 |
 | **支持事务**       | 提供 **脏页管理** 和 **缓冲刷盘（Flush）** 机制，保证事务一致性 |
 
+### 为什么 BufferPool 要用 Map，当缓存为什么要用 Map？
+**缓存的本质：Key → Value 的快速查找。**
+
+这里的 Key 是 PageId，Value 是内存里的 Page 对象。 用 Map（哈希表）可以把命中查找做到平均 O(1)。
 ## 2.5 HeapFile access method
 ### Exercise4
 ***
@@ -176,6 +188,14 @@ ant test
 
 #### HeapPage
 **HeapPage** 代表数据库文件中的一个数据页（Page），它是数据库存储的最小单位。每个 HeapPage 负责存储一定数量的元组（Tuple），并维护页面的元数据。
+
+| 层级      | 对应类        | 含义                                   |
+|-----------|---------------|----------------------------------------|
+| HeapFile | `HeapFile`    | 表的数据文件，管理所有页面的存取       |
+| Page     | `HeapPage`    | 页（固定大小块），负责存放 slot 和 header |
+| Slot     | 位图 + offset 逻辑控制 | 页中的格子，每个 slot 存一个 tuple     |
+| Tuple    | `Tuple`       | 表中的一条记录（行）                   |
+
 1. **从磁盘读取字节数据来创建 HeapPage**  
        计算机存储数据时，通常会将数据分页存储在磁盘上。要使用这些数据，就需要从磁盘读取它们，并按照特定格式解析成可操作的结构。HeapPage 就是这样的一个数据结构，它用于存储一页（Page）的数据。
 2. **HeapPage 的结构**  
@@ -203,6 +223,26 @@ ant test
     - 用于比较 null
   - equals: 用于比较对象的内容
 
+#### 关于isSlotUsed()的设计
+
+概念了解
+
+- header 是一个 byte 数组，每个字节负责“8 个slot”的状态，相当于一个slot占一个bit。
+- 比如有16个slot，那么header就需要2个byte ceil（16/8）=2。header[0] → 控制 slot 0–7，header[1] → 控制 slot 8–15。
+- All Java virtual machines are **big-endian**.所以对于 header[0]，bit 0 是最低位，bit 7 是最高位。
+
+  | 位编号 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 |
+  |--------|---|---|---|---|---|---|---|---|
+  | 值     | 1 | 0 | 1 | 1 | 0 | 1 | 0 | 1 |
+
+关于isSlotUsed()的设计
+
+- 首先得确定 slot 在 header 中的位置，在header[几]里 / 在哪个byte里
+- 确定 slot 在 header[几]里的位置 / 哪个bit
+- 举例如下，header[0] = 10110101，然后在第6位
+- 然后我们需要把 header[0] 右移6位，变成 00000010（big-endian），这样就能使得第6位变成最低位
+- 最后 & 1（00000001），判断最低位是0还是1
+
 ### Exercise 5
 ***
 
@@ -212,16 +252,28 @@ ant test
 
 
 - **HeapFile** 是多个 HeapPage 组成的数据库文件，它负责管理整个表的数据，包括存取、修改和组织数据页面。
+- 实现 HeapFile.readPage(PageId pid)，从磁盘读取某一页，自己算偏移（从文件里精确地定位到那一页的位置，然后读出它的字节数据），不要走 BufferPool （BufferPool缓存的是Page）
+- 实现 HeapFile.iterator()，用 BufferPool.getPage 获取页，再从页取 tuple
 
-#### iterator() -- 对HeapFile进行迭代，以便能够一条一条地读取存储在 HeapPage 里的数据
-1. **匿名内部类是什么?**  
+#### iterator() -- 对HeapFile进行迭代，以便能够一条一条地读取存储在 HeapPage 里的数据。
+1. **数据库的表（HeapFile）是怎样存的？**
+   HeapFile (表)
+   ├── HeapPage 0  → [tuple0, tuple1, tuple2]
+   ├── HeapPage 1  → [tuple3, tuple4]
+   ├── HeapPage 2  → [tuple5, tuple6, tuple7, tuple8]
+   ...
+2. **iterator() 的作用是？**
+   从第一页开始 → 遍历里面的 tuple → 下一页 → 再遍历 → … 直到最后一条
+3. **匿名内部类是什么?**  
 匿名内部类（Anonymous Inner Class）是一种没有名字的类，通常在定义并实例化时同时创建。它的主要作用是简化代码，当一个类只在某个特定地方使用一次时，可以用匿名类代替普通类。  
     ``` java
    return new DbFileIterator() { 
         // 这里是匿名内部类的实现
     };
     ```
-2. **为什么要用匿名内部类?**
+4. **为什么使用iterator？**
+   数据量大，不能一口气把所有 tuple 全读进内存 -> 数据库“流式读取”，不会内存爆炸
+5. **为什么要用匿名内部类?**
    - 这个迭代器只在 iterator() 方法中使用，不需要单独创建类。
       
    - 我们需要一个遍历 HeapFile 的方法，能：
@@ -232,7 +284,7 @@ ant test
      - 支持 close() 释放资源
    - 这基本就是Java 的迭代器模式（Iterator Pattern）。（仿照Java的Iterator类写DbFileIterator），多一个void open() - 初始化迭代器，开始遍历 HeapFile
 
-3. **为什么用PageId不用HeapPageID?**     
+5. **为什么用PageId不用HeapPageID?**     
 支持多态（不同类型的 Page ID），代码更解耦（BufferPool 只依赖 PageId），可扩展性强（以后可以用 BTreePageId）。
 
 ## 2.6 Operators
@@ -246,6 +298,15 @@ ant test
 - **operator**:
   - 数据库中的 Operator（操作符） 主要用于 查询处理（Query Processing），它们组成查询执行计划（Query Execution Plan），可以理解为数据库的“计算单元”。
     关系代数操作符，对应 SQL 语句的基本操作（SELECT，JOIN等）；物理执行操作符，在底层实现查询。
+  - 例如SELECT name FROM student WHERE grade > 80; 它的执行过程（查询计划）大概是这样的：SeqScan（顺序扫描整张 student 表，读出所有 tuple） → Filter（筛选出 grade > 80 的 tuple） → Project（只留下 name 列）
+  - 这些算子是“链”起来工作的，每个算子可以把“下一级算子”作为输入
+  - 查询计划是一棵树 （最下面的选手（SeqScan）从磁盘“取数据”，一路往上传递给上面的选手）
+    Project
+    ↑
+    Filter
+    ↑
+    SeqScan  ← 叶子节点，直接访问磁盘
+  - 最底层的算子是访问方法（Access Method），它们直接去磁盘拿数据，不依赖其他算子
 - **查询计划（Query Plan**）是一个操作符组成的“树”:
   - 根操作符（Root Operator） 在最上层，负责返回最终查询结果。 
   - 叶子操作符（Leaf Operator） 负责从磁盘读取数据。 
@@ -255,6 +316,14 @@ ant test
   - 根操作符会调用它的子操作符的 getNext()，一直往下调用，直到到达叶子操作符。 
   - 叶子操作符从磁盘读取数据，然后把 Tuple 向上传递。 
   - 数据在查询计划中不断传递、合并、过滤，直到最终返回给用户。
+
+#### SeqScan（顺序扫描）要做的事
+1. 找到表（通过 tableId）
+2. 获取它的 DbFile.iterator()
+3. 依次返回所有 tuple
+
+#### reset的作用
+如果你扫描完一张表后，还想用同一个 SeqScan 对象去扫另一张表，不用重新创建新对象，只要调用reset()，把tableId和tableAlias换掉就行了。
 
 #### 遇到报错 
 ![img_11.png](img/img_11.png)  
@@ -276,4 +345,50 @@ private int getHeaderSize() {
 ```
 
 ## Summary
-完成以上代码之后，可以实现一个数据库的简单查询（比如SELECT * FROM table;）
+完成以上代码之后，可以实现一个数据库的简单查询（比如SELECT * FROM table）
+比如我们有一个文本文件：
+```angular2html
+1,1,1
+2,2,2
+3,4,4
+```
+想实现类似：SELECT * FROM some_data_file
+```
+package simpledb;
+import java.io.*;
+
+public class test {
+
+    public static void main(String[] argv) {
+
+        // construct a 3-column table schema 
+        Type types[] = new Type[]{ Type.INT_TYPE, Type.INT_TYPE, Type.INT_TYPE };
+        String names[] = new String[]{ "field0", "field1", "field2" };
+        TupleDesc descriptor = new TupleDesc(types, names);
+
+        // create the table, associate it with some_data_file.dat
+        // and tell the catalog about the schema of this table.
+        HeapFile table1 = new HeapFile(new File("some_data_file.dat"), descriptor);
+        Database.getCatalog().addTable(table1, "test");
+
+        // construct the query: we use a simple SeqScan, which spoonfeeds
+        // tuples via its iterator.
+        TransactionId tid = new TransactionId();
+        SeqScan f = new SeqScan(tid, table1.getId());
+
+        try {
+            // and run it
+            f.open(); // 打开扫描器（相当于开始查询）
+            while (f.hasNext()) { // // 逐条取出 tuple
+                Tuple tup = f.next();
+                System.out.println(tup);
+            }
+            f.close(); // // 查询结束
+            Database.getBufferPool().transactionComplete(tid);
+        } catch (Exception e) {
+            System.out.println ("Exception : " + e);
+        }
+    }
+
+}
+```

@@ -106,6 +106,7 @@ public class SeqScan implements OpIterator {
      * @return the TupleDesc with field names from the underlying HeapFile,
      *         prefixed with the tableAlias string from the constructor.
      */
+    // 给字段名加上 “别名.”，在 join 多张表时，很多列名可能相同（比如都叫 id），加前缀后就不会混淆
     public TupleDesc getTupleDesc() {
         // Retrieve the original TupleDesc from the underlying file.
         TupleDesc originalTD = Database.getCatalog().getTupleDesc(tableid);
