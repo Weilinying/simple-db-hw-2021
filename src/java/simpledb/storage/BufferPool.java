@@ -9,6 +9,9 @@ import simpledb.transaction.TransactionId;
 
 import java.io.*;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -30,11 +33,8 @@ public class BufferPool {
 
     private final int maxPages;
 
-    // 为什么前面用Map，这里用ConcurrentHashMap？
-    // 之前的Map是用作接口，makeing code more flexible。
-    // 对于BufferPool这种component来说，may be accessed concurrently by multiple threads，需要线程安全
-    private final ConcurrentHashMap<PageId, Page> pageCache;
-    
+    private final LinkedHashMap<PageId, Page> pageCache;
+
     /** Default number of pages passed to the constructor. This is used by
     other classes. BufferPool should use the numPages argument to the
     constructor instead. */
@@ -47,7 +47,7 @@ public class BufferPool {
      */
     public BufferPool(int numPages) {
         this.maxPages = numPages;
-        pageCache = new ConcurrentHashMap<>();
+        pageCache = new LinkedHashMap<>(16, 0.75f, true);
     }
     
     public static int getPageSize() {
@@ -89,7 +89,7 @@ public class BufferPool {
         // If the buffer pool is full (i.e. number of pages equals maxPages),
         // throw an exception because no eviction policy is implemented for this lab.
         if (pageCache.size() >= maxPages) {
-            throw new DbException("Buffer pool is full, no eviction policy implemented.");
+            evictPage();
         }
 
         // Load the page from disk.
@@ -164,7 +164,17 @@ public class BufferPool {
     public void insertTuple(TransactionId tid, int tableId, Tuple t)
         throws DbException, IOException, TransactionAbortedException {
         // some code goes here
-        // not necessary for lab1
+        // 1. 找到这张表对应的 DbFile（通常是 HeapFile）
+        DbFile file = Database.getCatalog().getDatabaseFile(tableId);
+
+        // 2. 让文件层完成真正的插入，返回“被修改的页们”
+        List<Page> dirtyPages = file.insertTuple(tid, t);
+
+        // 3. 标脏 + 更新缓存（让后续访问看到最新版本）
+        for (Page p : dirtyPages) {
+            p.markDirty(true, tid);
+            pageCache.put(p.getId(), p); // 覆盖旧版本（若已有）
+       }
     }
 
     /**
@@ -183,7 +193,18 @@ public class BufferPool {
     public  void deleteTuple(TransactionId tid, Tuple t)
         throws DbException, IOException, TransactionAbortedException {
         // some code goes here
-        // not necessary for lab1
+        // 1. 从待删 tuple 的 RecordId 推回 tableId
+        int tableId = t.getRecordId().getPageId().getTableId();
+        DbFile file = Database.getCatalog().getDatabaseFile(tableId);
+
+        // 2. 让文件层完成真正的删除
+        List<Page> dirtyPages = file.deleteTuple(tid, t);
+
+        // 3) 标脏 + 更新缓存
+        for (Page p : dirtyPages) {
+            p.markDirty(true, tid);
+            pageCache.put(p.getId(), p);
+        }
     }
 
     /**
@@ -194,6 +215,9 @@ public class BufferPool {
     public synchronized void flushAllPages() throws IOException {
         // some code goes here
         // not necessary for lab1
+        for (PageId pid : pageCache.keySet()) {
+            flushPage(pid);
+        }
 
     }
 
@@ -208,6 +232,7 @@ public class BufferPool {
     public synchronized void discardPage(PageId pid) {
         // some code goes here
         // not necessary for lab1
+        pageCache.remove(pid);
     }
 
     /**
@@ -217,6 +242,18 @@ public class BufferPool {
     private synchronized  void flushPage(PageId pid) throws IOException {
         // some code goes here
         // not necessary for lab1
+        Page page = pageCache.get(pid);
+        if (page == null) {
+            return; // Page not in cache, nothing to flush
+        }
+        if (page.isDirty() != null) {
+            // Get the DbFile that contains this page
+            DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+            // 写回磁盘
+            dbFile.writePage(page);
+            // // 清除脏标记
+            page.markDirty(false, null);
+        }
     }
 
     /** Write all pages of the specified transaction to disk.
@@ -233,6 +270,34 @@ public class BufferPool {
     private synchronized  void evictPage() throws DbException {
         // some code goes here
         // not necessary for lab1
+
+        if (pageCache.isEmpty()) {
+            throw new DbException("BufferPool is empty, cannot evict any page.");
+        }
+
+        PageId victimPid = null;
+
+        // 从最老到最新（LRU），找“干净页”
+        // 不使用pageCache.entrySet()，而是创建一个副本，避免在遍历过程中触发 LinkedHashMap 的结构性修改
+        for (PageId pid : new ArrayList<>(pageCache.keySet())) {
+            Page victimPage = pageCache.get(pid);
+            if (victimPage.isDirty() == null) { // 找到一个干净页
+                victimPid = pid;
+                break;
+            }
+        }
+
+        // 有干净页：直接驱逐
+        if (victimPid != null) {
+            // 从缓存中移除
+            pageCache.remove(victimPid);
+            return;
+        }
+
+        // 全是脏页：NO-STEAL -> 不允许驱逐，直接失败
+        throw new DbException("All pages are dirty; cannot evict under NO-STEAL policy.");
+
+
     }
 
 }

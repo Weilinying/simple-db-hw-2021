@@ -28,6 +28,8 @@ public class HeapPage implements Page {
     byte[] oldData;
     private final Byte oldDataLock= (byte) 0;
 
+    private TransactionId dirtyTid = null;  // 最近修改该页的事务 ID（用于事务恢复）
+
     /**
      * Create a HeapPage from a set of bytes of data read from disk.
      * The format of a HeapPage is a set of header bytes indicating
@@ -246,6 +248,26 @@ public class HeapPage implements Page {
     public void deleteTuple(Tuple t) throws DbException {
         // some code goes here
         // not necessary for lab1
+
+        // 1. 检查tuple是否属于该页
+        RecordId rid = t.getRecordId();
+        if (rid == null){
+            throw new DbException("Tuple does not have a RecordId.");
+        }
+        if (!rid.getPageId().equals(this.pid)){
+            throw new DbException("Tuple does not belong to this page.");
+        }
+
+        // 2. 校验该 slot 当前确实是占用状态
+        int slotIndex = rid.getTupleNumber();
+        if (!isSlotUsed(slotIndex)) {
+            throw new DbException("Tuple slot is already empty.");
+        }
+
+        // 3. 删除 tuple 并更新 header
+        tuples[slotIndex] = null; // 删除 tuple
+        markSlotUsed(slotIndex, false); // 更新 header，标记该 slot 为空
+
     }
 
     /**
@@ -258,15 +280,41 @@ public class HeapPage implements Page {
     public void insertTuple(Tuple t) throws DbException {
         // some code goes here
         // not necessary for lab1
+
+        // 1. 检查 tuple 的 TupleDesc 是否匹配
+        if (!t.getTupleDesc().equals(this.td)) {
+            throw new DbException("TupleDesc mismatch.");
+        }
+
+        // 2. 查找一个空闲的 slot
+        for (int i = 0; i < numSlots; i++) {
+            if (!isSlotUsed(i)) {
+                // 3. 找到空闲 slot，插入 tuple 并更新 header
+                tuples[i] = t;
+                t.setRecordId(new RecordId(this.pid, i));
+                markSlotUsed(i, true);  // 更新 header，标记该 slot 为已使用
+                return;
+            }
+        }
+        throw new DbException("Page is full, no empty slots available.");
+
     }
 
     /**
      * Marks this page as dirty/not dirty and record that transaction
      * that did the dirtying
+     * 标记该页是否被某事务修改过（dirty）
+     * 这个信息会被 BufferPool 用来决定刷盘（从内存写回磁盘）或日志恢复。
      */
     public void markDirty(boolean dirty, TransactionId tid) {
         // some code goes here
-	// not necessary for lab1
+	    // not necessary for lab1
+        if(dirty){
+            this.dirtyTid = tid;
+        }
+        else{
+            this.dirtyTid = null;
+        }
     }
 
     /**
@@ -274,8 +322,9 @@ public class HeapPage implements Page {
      */
     public TransactionId isDirty() {
         // some code goes here
-	// Not necessary for lab1
-        return null;      
+    	// Not necessary for lab1
+
+        return this.dirtyTid;
     }
 
     /**
@@ -312,6 +361,17 @@ public class HeapPage implements Page {
     private void markSlotUsed(int i, boolean value) {
         // some code goes here
         // not necessary for lab1
+
+        int byteIndex = i / 8;  // 确定当前槽位 i 位于 header 数组的哪个字节
+        int bitOffset = i % 8;  // 确定当前槽位 i 在这个字节的哪一位（0-7）
+        if(value){
+            // 将对应位设为 1（使用位运算的 OR 操作）
+            header[byteIndex] = (byte) (header[byteIndex] | (1 << bitOffset));
+        }
+        else{
+            // 将对应位设为 0（使用位运算的 AND 和 NOT 操作）
+            header[byteIndex] = (byte) (header[byteIndex] & ~(1 << bitOffset));
+        }
     }
 
     /**

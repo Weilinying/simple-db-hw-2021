@@ -95,7 +95,29 @@ public class HeapFile implements DbFile {
     // see DbFile.java for javadocs
     public void writePage(Page page) throws IOException {
         // some code goes here
-        // not necessary for lab1
+
+        // 1. Page必须属于这个 HeapFile
+        if (!(page instanceof HeapPage) || ((HeapPageId) page.getId()).getTableId() != getId()) {
+            throw new IllegalArgumentException("Page does not belong to this HeapFile.");
+        }
+
+        // 2. 计算页在文件中的偏移量 pageNo × pageSize （第几个字节开始）
+        int pageNo = page.getId().getPageNumber();
+        int pageSize = BufferPool.getPageSize();
+        long offset = (long) pageNo * pageSize; // 转成 long 防止溢出
+
+        // 3. 把内存中的 Page 对象（Java 中的数据结构）转换成一段连续的 字节数组（byte[]），以便写入磁盘文件
+        byte[] data = page.getPageData();
+        if (data.length != pageSize) {
+            throw new IllegalArgumentException("Page data length does not match page size.");
+        }
+
+        // 4. 随机访问文件，跳到正确的偏移量，写入磁盘
+        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+            raf.seek(offset); // 将文件指针移动到该页起始位置
+            raf.write(data); // 将页面数据写入文件
+        }
+
     }
 
     /**
@@ -109,16 +131,66 @@ public class HeapFile implements DbFile {
     public List<Page> insertTuple(TransactionId tid, Tuple t)
             throws DbException, IOException, TransactionAbortedException {
         // some code goes here
-        return null;
-        // not necessary for lab1
+
+        // 1. 找到一页有空闲槽位的页
+        for (int i = 0; i < numPages(); i++) {
+            HeapPageId pid = new HeapPageId(getId(), i);
+            // 通过 BufferPool 以可写权限拿页
+            HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+            // 检查该页是否有空闲槽位
+            if (page.getNumEmptySlots() > 0) {
+                // 在该页中插入元组
+                page.insertTuple(t);
+                // 返回修改过的页
+                ArrayList<Page> modified = new ArrayList<>();
+                modified.add(page);
+                return modified;
+            }
+        }
+
+        // 2. 如果没有页有空闲槽位，在文件末尾追加一个新空页，然后再插
+        // 2.1 先把空页的字节写到文件最后，等于“扩容”文件
+        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+            raf.seek(raf.length()); // 跳到文件末尾
+
+            raf.write(HeapPage.createEmptyPageData()); // 写入一个空页的字节数据
+        }
+
+        // 2.2 新页创建好后，页号是 numPages() - 1
+        int newPageNo = numPages() - 1;
+        HeapPageId newPid = new HeapPageId(getId(), newPageNo);
+
+        // 2.3 通过 BufferPool 以可写权限拿新页
+        HeapPage newPage = (HeapPage) Database.getBufferPool().getPage(tid, newPid, Permissions.READ_WRITE);
+        newPage.insertTuple(t);
+
+        ArrayList<Page> modified = new ArrayList<>();
+        modified.add(newPage);
+        return modified;
+
     }
 
     // see DbFile.java for javadocs
     public ArrayList<Page> deleteTuple(TransactionId tid, Tuple t) throws DbException,
             TransactionAbortedException {
         // some code goes here
-        return null;
-        // not necessary for lab1
+
+        // 1. 根据 tuple 自带的 RecordId 找到它在哪一页
+        RecordId rid = t.getRecordId();
+        PageId pid = rid.getPageId();
+
+        // 检查这个页是否属于这个 HeapFile
+        if (!(pid instanceof HeapPageId) || ((HeapPageId) pid).getTableId() != getId()) {
+            throw new DbException("Tuple does not belong to this HeapFile.");
+        }
+
+        // 2. 通过 BufferPool 以可写权限拿页，让页删除该 tuple
+        HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+        page.deleteTuple(t);
+
+        ArrayList<Page> modified = new ArrayList<>();
+        modified.add(page);
+        return modified;
     }
 
     // see DbFile.java for javadocs

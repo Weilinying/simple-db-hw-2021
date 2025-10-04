@@ -14,6 +14,11 @@ public class Join extends Operator {
 
     private static final long serialVersionUID = 1L;
 
+    private final JoinPredicate predicate;
+    private OpIterator child1;
+    private OpIterator child2;
+    private Tuple leftTuple;
+
     /**
      * Constructor. Accepts two children to join and the predicate to join them
      * on
@@ -27,11 +32,15 @@ public class Join extends Operator {
      */
     public Join(JoinPredicate p, OpIterator child1, OpIterator child2) {
         // some code goes here
+        this.predicate = p;
+        this.child1 = child1;
+        this.child2 = child2;
+        this.leftTuple = null;
     }
 
     public JoinPredicate getJoinPredicate() {
         // some code goes here
-        return null;
+        return predicate;
     }
 
     /**
@@ -41,7 +50,7 @@ public class Join extends Operator {
      * */
     public String getJoinField1Name() {
         // some code goes here
-        return null;
+        return child1.getTupleDesc().getFieldName(predicate.getField1());
     }
 
     /**
@@ -51,7 +60,7 @@ public class Join extends Operator {
      * */
     public String getJoinField2Name() {
         // some code goes here
-        return null;
+        return child2.getTupleDesc().getFieldName(predicate.getField2());
     }
 
     /**
@@ -60,20 +69,31 @@ public class Join extends Operator {
      */
     public TupleDesc getTupleDesc() {
         // some code goes here
-        return null;
+        return TupleDesc.merge(child1.getTupleDesc(), child2.getTupleDesc());
     }
 
     public void open() throws DbException, NoSuchElementException,
             TransactionAbortedException {
         // some code goes here
+        super.open();
+        child1.open();
+        child2.open();
+        leftTuple = null; // 重置状态
     }
 
     public void close() {
         // some code goes here
+        child1.close();
+        child2.close();
+        leftTuple = null; // 重置状态
+        super.close();
     }
 
     public void rewind() throws DbException, TransactionAbortedException {
         // some code goes here
+        child1.rewind();
+        child2.rewind();
+        leftTuple = null; // 重置状态
     }
 
     /**
@@ -96,18 +116,58 @@ public class Join extends Operator {
      */
     protected Tuple fetchNext() throws TransactionAbortedException, DbException {
         // some code goes here
+        // 当前 leftTuple 不为空或者 child1 还有下一个 tuple 时进入 while 循环
+        while(leftTuple != null || child1.hasNext()) {
+            if (leftTuple == null) {
+                leftTuple = child1.next();
+                child2.rewind(); // 右表 (child2) 重新开始
+            }
+
+            // 遍历右表 (child2) 所有的 tuple
+            while (child2.hasNext()) {
+                Tuple rightTuple = child2.next();
+                // 判断是否满足join条件
+                if (predicate.filter(leftTuple, rightTuple)) {
+                    // 创建一个新的tuple，用于存放join结果
+                    TupleDesc mergeDesc = TupleDesc.merge(leftTuple.getTupleDesc(), rightTuple.getTupleDesc()); // 合并两个表的Schema
+                    Tuple mergedTuple = new Tuple(mergeDesc);
+
+                    int idx = 0;
+                    // 把 leftTuple 的字段值复制到 mergedTuple
+                    for (int i = 0; i < leftTuple.getTupleDesc().numFields(); i++) {
+                        mergedTuple.setField(idx++, leftTuple.getField(i));
+                    }
+                    // 把 rightTuple 的字段值复制到 mergedTuple
+                    for (int i = 0; i < rightTuple.getTupleDesc().numFields(); i++) {
+                        mergedTuple.setField(idx++, rightTuple.getField(i));
+                    }
+
+                    // 返回join后的结果
+                    return mergedTuple;
+                }
+            }
+            leftTuple = null; // 处理完当前leftTuple，重置为null以便取下一个
+        }
         return null;
     }
 
     @Override
     public OpIterator[] getChildren() {
         // some code goes here
-        return null;
+        return new OpIterator[]{child1, child2};
     }
 
     @Override
     public void setChildren(OpIterator[] children) {
         // some code goes here
+        if (children.length != 2) {
+            throw new IllegalArgumentException("Expected exactly two children");
+        }
+        if (children[0] == null || children[1] == null) {
+            throw new IllegalArgumentException("Children cannot be null");
+        }
+        this.child1 = children[0];
+        this.child2 = children[1];
     }
 
 }
