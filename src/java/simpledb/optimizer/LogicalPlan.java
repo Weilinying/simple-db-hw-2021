@@ -2,9 +2,11 @@ package simpledb.optimizer;
 import simpledb.common.Catalog;
 import simpledb.common.Database;
 import simpledb.ParsingException;
+import simpledb.common.DbException;
 import simpledb.common.Type;
 import simpledb.execution.*;
 import simpledb.storage.*;
+import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
 
 import java.util.*;
@@ -478,7 +480,7 @@ public class LogicalPlan {
         return new Project(outFields, outTypes, node);
     }
 
-    public static void main(String[] argv) {
+    public static void main(String[] argv) throws TransactionAbortedException, DbException {
         // construct a 3-column table schema
         Type[] types = new Type[]{ Type.INT_TYPE, Type.INT_TYPE, Type.INT_TYPE };
         String[] names = new String[]{ "field0", "field1", "field2" };

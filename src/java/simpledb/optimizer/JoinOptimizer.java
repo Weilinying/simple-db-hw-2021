@@ -130,7 +130,7 @@ public class JoinOptimizer {
             // HINT: You may need to use the variable "j" if you implemented
             // a join algorithm that's more complicated than a basic
             // nested-loops join.
-            return -1.0;
+            return cost1 + card1 * cost2 + (double)card1 * card2;
         }
     }
 
@@ -168,6 +168,19 @@ public class JoinOptimizer {
 
     /**
      * Estimate the join cardinality of two tables.
+     * public static int estimateTableJoinCardinality(
+     *     Predicate.Op joinOp,            // 👉 JOIN 的操作符
+     *     String table1Alias,             // 👉 左表在查询中的别名
+     *     String table2Alias,             // 👉 右表在查询中的别名
+     *     String field1PureName,          // 👉 左表参与 JOIN 的字段名（不带别名）
+     *     String field2PureName,          // 👉 右表参与 JOIN 的字段名（不带别名）
+     *     int card1,                      // 👉 左表的元组数（经过过滤后的估计值）
+     *     int card2,                      // 👉 右表的元组数（经过过滤后的估计值）
+     *     boolean t1pkey,                // 👉 左表的 join 字段是否是主键
+     *     boolean t2pkey,                // 👉 右表的 join 字段是否是主键
+     *     Map<String, TableStats> stats, // 👉 每张表的统计信息（TableStats）
+     *     Map<String, Integer> tableAliasToId // 👉 从表别名映射到表 id（因为 catalog 用 id 索引）
+     * )
      * */
     public static int estimateTableJoinCardinality(Predicate.Op joinOp,
                                                    String table1Alias, String table2Alias, String field1PureName,
@@ -176,6 +189,32 @@ public class JoinOptimizer {
                                                    Map<String, Integer> tableAliasToId) {
         int card = 1;
         // some code goes here
+        // 1. 等值连接
+        if (joinOp == Predicate.Op.EQUALS) {
+            // 1.1 只有 t1.a 是主键
+            if (t1pkey && !t2pkey) {
+                // 左表字段是主键：每个左表值最多匹配一条右表 → 总行数不超过右表行数
+                card = card2;
+            }
+            // 1.2 只有 t2.b 是主键
+            else if (!t1pkey && t2pkey) {
+                card = card1;
+            }
+            // 1.3 t1.a 和 t2.b 都是主键
+            else if (t1pkey && t2pkey) {
+                // 两边都是主键：一对一，最多是两边较小者
+                card = Math.min(card1, card2);
+            }
+            // 1.4 t1.a 和 t2.b 都不是主键
+            else {
+                card = Math.max(card1, card2);
+            }
+        }
+        // 2. 范围链接
+        else{
+            double frac = 0.3;
+            card = (int) Math.round((double)card1 * card2 * frac);
+        }
         return card <= 0 ? 1 : card;
     }
 
@@ -237,8 +276,43 @@ public class JoinOptimizer {
             throws ParsingException {
 
         // some code goes here
-        //Replace the following
-        return joins;
+        // 1. 保存最优子计划的缓存
+        PlanCache pc = new PlanCache();
+
+        // 2. 依次计算大小为 1, 2, ..., joins.size() 的子集
+        for (int i = 1; i <= joins.size(); i++) {
+            // 2.1 枚举所有大小为 i 的子集
+            for (Set<LogicalJoinNode> s : enumerateSubsets(joins, i)) {
+                double bestCost = Double.MAX_VALUE;
+                CostCard bestPlan = null;
+
+                // 2.2 枚举子集中的每个 join，尝试将其作为最后执行的 join
+                for (LogicalJoinNode j : s) {
+                    CostCard cc = computeCostAndCardOfSubplan(stats,
+                            filterSelectivities, j, s, bestCost, pc);
+                    if (cc != null && cc.cost < bestCost) {
+                        bestCost = cc.cost;
+                        bestPlan = cc;
+                    }
+                }
+
+                // 2.3 将最优子计划加入缓存
+                if (bestPlan != null) {
+                    pc.addPlan(s, bestPlan.cost, bestPlan.card,
+                            bestPlan.plan);
+                }
+            }
+        }
+
+        // 3. 从缓存中获取整个 joins 集合的最优计划
+        Set<LogicalJoinNode> js = new HashSet<>(joins);
+        List<LogicalJoinNode> bestPlan = pc.getOrder(js);
+
+        if (explain) {
+            printJoins(bestPlan, pc, stats, filterSelectivities);
+        }
+
+        return bestPlan;
     }
 
     // ===================== Private Methods =================================

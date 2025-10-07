@@ -1,11 +1,14 @@
 package simpledb.optimizer;
 
 import simpledb.common.Database;
+import simpledb.common.DbException;
 import simpledb.common.Type;
 import simpledb.execution.Predicate;
 import simpledb.execution.SeqScan;
 import simpledb.storage.*;
 import simpledb.transaction.Transaction;
+import simpledb.transaction.TransactionAbortedException;
+import simpledb.transaction.TransactionId;
 
 import java.util.HashMap;
 import java.util.Iterator;
@@ -51,12 +54,15 @@ public class TableStats {
 
     public static void computeStatistics() {
         Iterator<Integer> tableIt = Database.getCatalog().tableIdIterator();
-
         System.out.println("Computing table stats.");
         while (tableIt.hasNext()) {
             int tableid = tableIt.next();
-            TableStats s = new TableStats(tableid, IOCOSTPERPAGE);
-            setTableStats(Database.getCatalog().getTableName(tableid), s);
+            try {
+                TableStats s = new TableStats(tableid, IOCOSTPERPAGE);
+                setTableStats(Database.getCatalog().getTableName(tableid), s);
+            } catch (TransactionAbortedException | DbException e) {
+                e.printStackTrace();
+            }
         }
         System.out.println("Done.");
     }
@@ -68,6 +74,22 @@ public class TableStats {
      */
     static final int NUM_HIST_BINS = 100;
 
+    // 绑定这张表 & I/O 参数
+    private final int tableId;
+    private final int ioCostPerPage;
+
+    // 访问表结构与数据的入口（为什么要 DbFile：能拿到 TupleDesc / 迭代所有 Tuple / 页数）
+    private final DbFile file;
+    private final TupleDesc td;
+    private final int numPages; // 扫描代价 = numPages × ioCostPerPage
+
+    // 统计数据
+    private int totalTuples; // 构造时算出来
+
+    // 每列的直方图（按下标存）
+    private final Map<Integer, IntHistogram> intHists = new HashMap<>();
+    private final Map<Integer, StringHistogram> stringHists = new HashMap<>();
+
     /**
      * Create a new TableStats object, that keeps track of statistics on each
      * column of a table
@@ -78,7 +100,7 @@ public class TableStats {
      *            The cost per page of IO. This doesn't differentiate between
      *            sequential-scan IO and disk seeks.
      */
-    public TableStats(int tableid, int ioCostPerPage) {
+    public TableStats(int tableid, int ioCostPerPage) throws TransactionAbortedException, DbException {
         // For this function, you'll have to get the
         // DbFile for the table in question,
         // then scan through its tuples and calculate
@@ -87,6 +109,85 @@ public class TableStats {
         // necessarily have to (for example) do everything
         // in a single scan of the table.
         // some code goes here
+        this.tableId = tableid;
+        this.ioCostPerPage = ioCostPerPage;
+        this.file = Database.getCatalog().getDatabaseFile(tableid);
+        this.td = file.getTupleDesc();
+        this.numPages = ((HeapFile) this.file).numPages();
+        this.totalTuples = 0;
+
+        // 1. 先遍历一遍，拿到每个 int 列的 min/max
+        int[] mins = new int[td.numFields()];
+        int[] maxs = new int[td.numFields()];
+        boolean[] seen = new boolean[td.numFields()]; // seen[i]：是否已经初始化过第 i 列的 min/max
+
+        // 创建一个事务 ID，表扫描需要事务上下文
+        TransactionId tid = new TransactionId();
+
+        // 获取这张表的迭代器（DbFileIterator 可以顺序遍历所有 Tuple）
+        DbFileIterator it = file.iterator(tid);
+
+        try {
+            // 遍历表中的每一行（tuple）
+            while (it.hasNext()) {
+                Tuple t = it.next();
+                this.totalTuples++;
+
+                // 遍历这一行的每一列（field）
+                for (int i = 0; i < td.numFields(); i++) {
+                    // 只关心 int 列，string 列的直方图不需要 min/max
+                    if (td.getFieldType(i) == Type.INT_TYPE) {
+                        int v = ((IntField)t.getField(i)).getValue();
+                        if (!seen[i]) {
+                            mins[i] = v;
+                            maxs[i] = v;
+                            seen[i] = true;
+                        } else {
+                            if (v < mins[i]) mins[i] = v;
+                            if (v > maxs[i]) maxs[i] = v;
+                        }
+                    }
+                }
+            }
+        } finally {
+            try { it.close(); } catch (Exception ignored) {}
+        }
+
+        // 2. 根据 min/max 初始化直方图
+        for (int i = 0; i < td.numFields(); i++) {
+            if (td.getFieldType(i) == Type.INT_TYPE) {
+                if (!seen[i]) {
+                    // 这一列全是 null，随便初始化一个直方图
+                    intHists.put(i, new IntHistogram(NUM_HIST_BINS, 0, 0));
+                } else {
+                    // int 列
+                    intHists.put(i, new IntHistogram(NUM_HIST_BINS, mins[i], maxs[i]));
+                }
+            } else {
+                // string 列
+                stringHists.put(i, new StringHistogram(NUM_HIST_BINS));
+            }
+        }
+
+        // 3. 再遍历一遍，把所有值都放进直方图
+        it.rewind();
+        try {
+            while (it.hasNext()) {
+                Tuple t = it.next();
+                for (int i = 0; i < td.numFields(); i++) {
+                    if (td.getFieldType(i) == Type.INT_TYPE) {
+                        int v = ((IntField)t.getField(i)).getValue();
+                        intHists.get(i).addValue(v);
+                    } else {
+                        String v = ((StringField)t.getField(i)).getValue();
+                        stringHists.get(i).addValue(v);
+                    }
+                }
+            }
+        } finally {
+            try { it.close(); } catch (Exception ignored) {}
+        }
+
     }
 
     /**
@@ -103,12 +204,13 @@ public class TableStats {
      */
     public double estimateScanCost() {
         // some code goes here
-        return 0;
+        return ioCostPerPage * numPages;
     }
 
     /**
      * This method returns the number of tuples in the relation, given that a
      * predicate with selectivity selectivityFactor is applied.
+     * 返回应用该过滤后预计还剩多少行
      * 
      * @param selectivityFactor
      *            The selectivity of any predicates over the table
@@ -117,7 +219,19 @@ public class TableStats {
      */
     public int estimateTableCardinality(double selectivityFactor) {
         // some code goes here
-        return 0;
+        // 边界1：选择率 <= 0，说明条件把所有行都过滤掉了，返回 0
+        if (selectivityFactor <= 0) return 0;
+
+        // 边界2：表本身没有行（或未知），无论选择率是多少，结果都是 0
+        if (totalTuples <= 0) return 0;
+
+        // 核心：总行数 × 选择率 = 期望保留的行数
+        // 用 Math.round 做“四舍五入”，比直接截断更稳（例如 0.6 -> 1）
+        int est = (int) Math.round(totalTuples * selectivityFactor);
+
+        // 兜底保护：理论上 est 不会为负，这里取个 max(0, est) 保守返回非负数
+        // （在本函数前两行的保护下，这一行通常不会起作用，仅作安全网）
+        return Math.max(0, est);
     }
 
     /**
@@ -129,9 +243,26 @@ public class TableStats {
      * The semantic of the method is that, given the table, and then given a
      * tuple, of which we do not know the value of the field, return the
      * expected selectivity. You may estimate this value from the histograms.
+     * avgSelectivity 是在你还不知道具体常量（比如 WHERE x.city = ?）时，给优化器一个“平均情况下这个条件能筛掉多少行”的估计，这样优化器才能先算体量、再选更便宜的执行计划
      * */
     public double avgSelectivity(int field, Predicate.Op op) {
         // some code goes here
+        if (field < 0 || field >= td.numFields()) return 1.0;
+
+        // 从直方图中估计平均选择率
+        if (td.getFieldType(field) == Type.INT_TYPE) {
+            IntHistogram hist = intHists.get(field);
+            if (hist != null) {
+                // 直接调用 IntHistogram 的方法
+                return hist.avgSelectivity();
+            }
+        } else {
+            StringHistogram hist = stringHists.get(field);
+            if (hist != null) {
+                // 直接调用 StringHistogram 的方法
+                return hist.avgSelectivity();
+            }
+        }
         return 1.0;
     }
 
@@ -141,15 +272,37 @@ public class TableStats {
      * 
      * @param field
      *            The field over which the predicate ranges
+     *            TupleDesc 里该列的位置
      * @param op
      *            The logical operation in the predicate
      * @param constant
      *            The value against which the field is compared
+     *            比较用的常量值
+     * estimateSelectivity(2, Predicate.Op.GREATER_THAN, new IntField(30)) -> 估计“第三列 > 30”的选择率
      * @return The estimated selectivity (fraction of tuples that satisfy) the
      *         predicate
      */
     public double estimateSelectivity(int field, Predicate.Op op, Field constant) {
         // some code goes here
+        if (field < 0 || field >= td.numFields()) return 1.0;
+        if (constant == null) return 1.0;
+
+        // 从直方图中估计选择率
+        if (td.getFieldType(field) == Type.INT_TYPE && constant.getType() == Type.INT_TYPE) {
+            IntHistogram hist = intHists.get(field);
+            if (hist != null) {
+                int v = ((IntField)constant).getValue();
+                // 直接调用 IntHistogram 的方法
+                return hist.estimateSelectivity(op, v);
+            }
+        } else if (td.getFieldType(field) == Type.STRING_TYPE && constant.getType() == Type.STRING_TYPE) {
+            StringHistogram hist = stringHists.get(field);
+            if (hist != null) {
+                String v = ((StringField)constant).getValue();
+                // 直接调用 StringHistogram 的方法
+                return hist.estimateSelectivity(op, v);
+            }
+        }
         return 1.0;
     }
 
@@ -158,7 +311,7 @@ public class TableStats {
      * */
     public int totalTuples() {
         // some code goes here
-        return 0;
+        return totalTuples;
     }
 
 }
