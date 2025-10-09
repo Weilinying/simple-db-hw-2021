@@ -9,7 +9,7 @@ public class IntHistogram {
     private final int buckets;
     private final int min;
     private final int max;
-    private final double width;    // 每个桶覆盖的范围宽度
+    private final int width;       // 每个桶覆盖的“整数个数”（至少为1）
     private final int[] bucketCounts; // 每个桶中的值的数量
     private int totalCount; // 所有值的总数（元组总数）
 
@@ -34,7 +34,9 @@ public class IntHistogram {
         this.buckets = buckets;
         this.min = min;
         this.max = max;
-        this.width = (double)(max - min + 1) / buckets;
+        // 保证桶宽至少为 1 个整数，避免域大小小于桶数时等值概率被放大
+        int domain = Math.max(0, max - min + 1); // 一共有多少个不同整数值
+        this.width = Math.max(1, (int) Math.ceil(domain / (double) buckets)); // “算平均每个桶该装多少个数”，并向上取整
         this.bucketCounts = new int[buckets];
         this.totalCount = 0;
     }
@@ -49,10 +51,8 @@ public class IntHistogram {
             throw new IllegalArgumentException("Value out of range");
         }
 
-        // 找到这个value属于哪个bucket
-        int bucketIndex = (int)((v - min) / width);
-
-        // 处理边界情况
+        // 找到这个 value 属于哪个 bucket（整数除法，最后一个桶兜底）
+        int bucketIndex = (v - min) / width;
         if (bucketIndex >= buckets) {
             bucketIndex = buckets - 1; // edge case: v == max
         }
@@ -110,46 +110,51 @@ public class IntHistogram {
             }
         }
 
-        // 计算selectivity需要的信息
-        int bucketIndex = (int)((v - min) / width);
-
+        // 计算 bucket 信息
+        int bucketIndex = (v - min) / width;
         if (bucketIndex >= buckets) {
             bucketIndex = buckets - 1; // edge case: v == max
         }
 
-        double b_left = min + bucketIndex * width; // bucket左边界
-        double b_right = b_left + width; // bucket右边界
-        double b_height = bucketCounts[bucketIndex]; // bucket高度（频数）
-        double b_freq = b_height / totalCount; // bucket频率（频数/总数）
+        int b_left = min + bucketIndex * width;        // 当前桶的左边界（包含）
+        int b_right = b_left + width;                   // 当前桶的右边界（不包含，半开区间）
+        int b_height = bucketCounts[bucketIndex];       // 当前桶内的频数
+        double b_freq = (double) b_height / totalCount; // 当前桶内的频率
 
         switch (op){
-            // P (X = v))
+            // P (X = v))，假设桶内对每个整数均匀分布
             case EQUALS:
-                return (b_height / width) / totalCount;
+                return ((double) b_height / width) / totalCount;
             // P (X != v)
             case NOT_EQUALS:
-                return 1.0 - (b_height / width) / totalCount;
+                return 1.0 - (((double) b_height / width) / totalCount);
             // P (X > v)
-            case GREATER_THAN:
-                // 计算当前bucket中大于v的部分
-                double b_part = (b_right - v) / width * b_freq;
-                // 计算所有右侧bucket的频率之和
+            case GREATER_THAN: {
+                double part = 0.0;
+                // 当前桶 > v 的整数个数占桶宽比例（不含 v 本身）
+                int greaterInBucket = Math.max(0, b_right - (v + 1));
+                part += b_freq * ((double) greaterInBucket / width);
+                // 右侧所有桶的频率之和
                 for (int i = bucketIndex + 1; i < buckets; i++) {
-                    b_part += (double)bucketCounts[i] / totalCount;
+                    part += (double) bucketCounts[i] / totalCount;
                 }
-                return b_part;
+                return part;
+            }
             // P (X >= v)
             case GREATER_THAN_OR_EQ:
                 return estimateSelectivity(Predicate.Op.GREATER_THAN, v) + estimateSelectivity(Predicate.Op.EQUALS, v);
             // P (X < v)
-            case LESS_THAN:
-                // 计算当前bucket中小于v的部分
-                double b_part2 = (v - b_left) / width * b_freq;
-                // 计算所有左侧bucket的频率之和
+            case LESS_THAN: {
+                double part = 0.0;
+                // 当前桶 < v 的整数个数占桶宽比例（不含 v 本身）
+                int lessInBucket = Math.max(0, v - b_left);
+                part += b_freq * ((double) lessInBucket / width);
+                // 左侧所有桶的频率之和
                 for (int i = 0; i < bucketIndex; i++) {
-                    b_part2 += (double) bucketCounts[i] / totalCount;
+                    part += (double) bucketCounts[i] / totalCount;
                 }
-                return b_part2;
+                return part;
+            }
             // P (X <= v)
             case LESS_THAN_OR_EQ:
                 return estimateSelectivity(Predicate.Op.LESS_THAN, v) + estimateSelectivity(Predicate.Op.EQUALS, v);
@@ -182,14 +187,11 @@ public class IntHistogram {
         sb.append("IntHistogram (total tuples = ").append(totalCount).append(")\n");
 
         for (int i = 0; i < buckets; i++) {
-            double b_left = min + i * width;
-            double b_right = b_left + width - 1;  // -1 保证右边界不重叠
-            if (i == buckets - 1) {
-                b_right = max; // 最后一个桶用 max 收尾，防止精度误差
-            }
+            int b_left = min + i * width;
+            int b_right = Math.min(max, b_left + width - 1);  // 包含右边界，最后一个桶对齐 max
 
             sb.append(String.format(
-                    "Bucket %2d: [%6.2f - %6.2f] count=%4d (%.2f%%)\n",
+                    "Bucket %2d: [%d - %d] count=%4d (%.2f%%)\n",
                     i, b_left, b_right, bucketCounts[i],
                     totalCount == 0 ? 0.0 : (bucketCounts[i] * 100.0 / totalCount)
             ));

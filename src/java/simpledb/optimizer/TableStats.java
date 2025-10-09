@@ -4,9 +4,7 @@ import simpledb.common.Database;
 import simpledb.common.DbException;
 import simpledb.common.Type;
 import simpledb.execution.Predicate;
-import simpledb.execution.SeqScan;
 import simpledb.storage.*;
-import simpledb.transaction.Transaction;
 import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
 
@@ -60,7 +58,7 @@ public class TableStats {
             try {
                 TableStats s = new TableStats(tableid, IOCOSTPERPAGE);
                 setTableStats(Database.getCatalog().getTableName(tableid), s);
-            } catch (TransactionAbortedException | DbException e) {
+            } catch (Exception e) {
                 e.printStackTrace();
             }
         }
@@ -100,7 +98,7 @@ public class TableStats {
      *            The cost per page of IO. This doesn't differentiate between
      *            sequential-scan IO and disk seeks.
      */
-    public TableStats(int tableid, int ioCostPerPage) throws TransactionAbortedException, DbException {
+    public TableStats(int tableid, int ioCostPerPage) {
         // For this function, you'll have to get the
         // DbFile for the table in question,
         // then scan through its tuples and calculate
@@ -128,14 +126,15 @@ public class TableStats {
         DbFileIterator it = file.iterator(tid);
 
         try {
-            // 遍历表中的每一行（tuple）
+            // 确保先打开迭代器
+            it.open();
+
+            // 第一次遍历：统计各 INT 列的最小值/最大值、总行数
             while (it.hasNext()) {
                 Tuple t = it.next();
                 this.totalTuples++;
 
-                // 遍历这一行的每一列（field）
                 for (int i = 0; i < td.numFields(); i++) {
-                    // 只关心 int 列，string 列的直方图不需要 min/max
                     if (td.getFieldType(i) == Type.INT_TYPE) {
                         int v = ((IntField)t.getField(i)).getValue();
                         if (!seen[i]) {
@@ -149,41 +148,43 @@ public class TableStats {
                     }
                 }
             }
-        } finally {
-            try { it.close(); } catch (Exception ignored) {}
-        }
 
-        // 2. 根据 min/max 初始化直方图
-        for (int i = 0; i < td.numFields(); i++) {
-            if (td.getFieldType(i) == Type.INT_TYPE) {
-                if (!seen[i]) {
-                    // 这一列全是 null，随便初始化一个直方图
-                    intHists.put(i, new IntHistogram(NUM_HIST_BINS, 0, 0));
+            // 2. 根据 min/max 初始化直方图
+            for (int i = 0; i < td.numFields(); i++) {
+                if (td.getFieldType(i) == Type.INT_TYPE) {
+                    if (!seen[i]) {
+                        // 若某列没有出现过（极端情形：空表），给个退化直方图
+                        intHists.put(i, new IntHistogram(NUM_HIST_BINS, 0, 0));
+                    } else {
+                        intHists.put(i, new IntHistogram(NUM_HIST_BINS, mins[i], maxs[i]));
+                    }
                 } else {
-                    // int 列
-                    intHists.put(i, new IntHistogram(NUM_HIST_BINS, mins[i], maxs[i]));
+                    stringHists.put(i, new StringHistogram(NUM_HIST_BINS));
                 }
-            } else {
-                // string 列
-                stringHists.put(i, new StringHistogram(NUM_HIST_BINS));
             }
-        }
 
-        // 3. 再遍历一遍，把所有值都放进直方图
-        it.rewind();
-        try {
+            // 3. 回到起点再遍历一次，将值灌入直方图
+            it.rewind();
             while (it.hasNext()) {
                 Tuple t = it.next();
                 for (int i = 0; i < td.numFields(); i++) {
                     if (td.getFieldType(i) == Type.INT_TYPE) {
-                        int v = ((IntField)t.getField(i)).getValue();
-                        intHists.get(i).addValue(v);
+                        IntHistogram hist = intHists.get(i);
+                        if (hist != null) {
+                            int v = ((IntField)t.getField(i)).getValue();
+                            hist.addValue(v);
+                        }
                     } else {
-                        String v = ((StringField)t.getField(i)).getValue();
-                        stringHists.get(i).addValue(v);
+                        StringHistogram hist = stringHists.get(i);
+                        if (hist != null) {
+                            String v = ((StringField)t.getField(i)).getValue();
+                            hist.addValue(v);
+                        }
                     }
                 }
             }
+        } catch (DbException | TransactionAbortedException e) {
+            throw new RuntimeException(e);
         } finally {
             try { it.close(); } catch (Exception ignored) {}
         }
@@ -259,7 +260,7 @@ public class TableStats {
         } else {
             StringHistogram hist = stringHists.get(field);
             if (hist != null) {
-                // 直接调用 StringHistogram 的方法
+                // 直接调用 StringHistogram 的 方法
                 return hist.avgSelectivity();
             }
         }
