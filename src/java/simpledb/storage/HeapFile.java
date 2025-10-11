@@ -25,6 +25,9 @@ public class HeapFile implements DbFile {
     private final File file;
 
     private final TupleDesc td;
+
+    private final Object allocMutex = new Object(); // 分配锁：保护“追加页”的临界区
+
     /**
      * Constructs a heap file backed by the specified file.
      * 
@@ -132,37 +135,57 @@ public class HeapFile implements DbFile {
             throws DbException, IOException, TransactionAbortedException {
         // some code goes here
 
+        BufferPool bp = Database.getBufferPool();
+
         // 1. 找到一页有空闲槽位的页
         for (int i = 0; i < numPages(); i++) {
             HeapPageId pid = new HeapPageId(getId(), i);
-            // 通过 BufferPool 以可写权限拿页
-            HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+            // 通过 BufferPool 以可读权限拿页
+            HeapPage page = (HeapPage) bp.getPage(tid, pid, Permissions.READ_ONLY);
             // 检查该页是否有空闲槽位
+            // 没有就局部放锁
+            if (page.getNumEmptySlots() <= 0){
+                bp.unsafeReleasePage(tid, pid);
+                continue; // 继续找下一页
+            }
+            // 有的话进入升级流程
+            // 升级
+            page = (HeapPage) bp.getPage(tid, pid, Permissions.READ_WRITE);
+
+            // 二次检查是否有空闲槽位
             if (page.getNumEmptySlots() > 0) {
                 // 在该页中插入元组
                 page.insertTuple(t);
+                page.markDirty(true, tid); // 标记为脏页
                 // 返回修改过的页
                 ArrayList<Page> modified = new ArrayList<>();
                 modified.add(page);
                 return modified;
             }
+            else{
+                // 二次检查没通过，释放锁，继续找下一页
+                bp.unsafeReleasePage(tid, pid);
+            }
         }
 
         // 2. 如果没有页有空闲槽位，在文件末尾追加一个新空页，然后再插
-        // 2.1 先把空页的字节写到文件最后，等于“扩容”文件
-        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
-            raf.seek(raf.length()); // 跳到文件末尾
+        // 没有可用页：原子地追加一页并确定唯一的新页号
+        HeapPageId newPid;
+        synchronized (allocMutex) { // 保护临界区
+            // 2.1 先把空页的字节写到文件最后，等于“扩容”文件
+            try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+                raf.seek(raf.length()); // 跳到文件末尾
 
-            raf.write(HeapPage.createEmptyPageData()); // 写入一个空页的字节数据
+                raf.write(HeapPage.createEmptyPageData()); // 写入一个空页的字节数据
+            }
+            // 2.2 新页创建好后，页号是 numPages() - 1
+            newPid = new HeapPageId(getId(), numPages() - 1);
         }
 
-        // 2.2 新页创建好后，页号是 numPages() - 1
-        int newPageNo = numPages() - 1;
-        HeapPageId newPid = new HeapPageId(getId(), newPageNo);
-
-        // 2.3 通过 BufferPool 以可写权限拿新页
-        HeapPage newPage = (HeapPage) Database.getBufferPool().getPage(tid, newPid, Permissions.READ_WRITE);
+        // 2.3 通过 BufferPool 对新页加写锁并插入
+        HeapPage newPage = (HeapPage) bp.getPage(tid, newPid, Permissions.READ_WRITE);
         newPage.insertTuple(t);
+        newPage.markDirty(true, tid); // 标记为脏页
 
         ArrayList<Page> modified = new ArrayList<>();
         modified.add(newPage);
@@ -187,6 +210,7 @@ public class HeapFile implements DbFile {
         // 2. 通过 BufferPool 以可写权限拿页，让页删除该 tuple
         HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
         page.deleteTuple(t);
+        page.markDirty(true, tid);
 
         ArrayList<Page> modified = new ArrayList<>();
         modified.add(page);

@@ -40,6 +40,8 @@ public class BufferPool {
     constructor instead. */
     public static final int DEFAULT_PAGES = 50;
 
+    private final LockerManager lockerManager = new LockerManager();
+
     /**
      * Creates a BufferPool that caches up to numPages pages.
      *
@@ -81,6 +83,15 @@ public class BufferPool {
      */
     public  Page getPage(TransactionId tid, PageId pid, Permissions perm)
         throws TransactionAbortedException, DbException {
+
+        // 在取页前阻塞加锁,避免因为“拿着 BufferPool 的 monitor 再去 wait”导致系统僵住
+        try{
+            lockerManager.acquire(tid, pid, perm);
+        }catch (InterruptedException e) {
+            throw new TransactionAbortedException();
+        }
+
+
         // If the page is already cached, return it.
         if (pageCache.containsKey(pid)) {
             return pageCache.get(pid);
@@ -115,6 +126,7 @@ public class BufferPool {
     public  void unsafeReleasePage(TransactionId tid, PageId pid) {
         // some code goes here
         // not necessary for lab1|lab2
+        lockerManager.release(tid, pid);
     }
 
     /**
@@ -125,13 +137,14 @@ public class BufferPool {
     public void transactionComplete(TransactionId tid) {
         // some code goes here
         // not necessary for lab1|lab2
+        transactionComplete(tid, true);
     }
 
     /** Return true if the specified transaction has a lock on the specified page */
     public boolean holdsLock(TransactionId tid, PageId p) {
         // some code goes here
         // not necessary for lab1|lab2
-        return false;
+        return lockerManager.holdsLock(tid, p);
     }
 
     /**
@@ -144,6 +157,36 @@ public class BufferPool {
     public void transactionComplete(TransactionId tid, boolean commit) {
         // some code goes here
         // not necessary for lab1|lab2
+        synchronized (this){
+            try{
+                for (PageId pid : new ArrayList<>(pageCache.keySet())) {
+                    Page page = pageCache.get(pid);
+                    TransactionId dirtier = page.isDirty();
+
+                    // 只处理“本事务修改过”的页
+                    if (dirtier != null && dirtier.equals(tid)) {
+                        if (commit){
+                            // 提交：写回磁盘
+                            flushPage(pid);
+                            // 标记干净，不需要，flushPage里已经实现
+                            // page.markDirty(false, null);
+                        } else {
+                            // 回滚：换成旧版本
+                            Page beforeImage = page.getBeforeImage();
+                            pageCache.put(pid, beforeImage);
+                        }
+                    }
+
+
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            } finally {
+                // 释放锁
+                lockerManager.releaseAll(tid);
+            }
+        }
+
     }
 
     /**
@@ -215,7 +258,10 @@ public class BufferPool {
     public synchronized void flushAllPages() throws IOException {
         // some code goes here
         // not necessary for lab1
-        for (PageId pid : pageCache.keySet()) {
+        // 注意：LinkedHashMap 是 access-order 的，flushPage 中的 get() 会触发重排，
+        // 直接遍历 keySet() 会导致 ConcurrentModificationException。
+        // 解决：对 keys 做一份快照再遍历。
+        for (PageId pid : new ArrayList<>(pageCache.keySet())) {
             flushPage(pid);
         }
 
@@ -296,7 +342,6 @@ public class BufferPool {
 
         // 全是脏页：NO-STEAL -> 不允许驱逐，直接失败
         throw new DbException("All pages are dirty; cannot evict under NO-STEAL policy.");
-
 
     }
 
