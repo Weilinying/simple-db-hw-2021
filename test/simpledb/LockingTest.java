@@ -99,8 +99,9 @@ public class LockingTest extends TestUtil.CreateHeapFile {
     Thread.sleep(TIMEOUT);
     assertEquals(expected, t.acquired());
 
-    // TODO(ghuo): yes, stop() is evil, but this is unit test cleanup
-    t.stop();
+    // 清理：在新 JDK 上 Thread.stop() 会抛 UnsupportedOperationException，改为 interrupt + join
+    t.interrupt();
+    t.join(1000);
   }
 
   /**
@@ -201,4 +202,3 @@ public class LockingTest extends TestUtil.CreateHeapFile {
   }
 
 }
-

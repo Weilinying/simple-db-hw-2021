@@ -188,7 +188,49 @@ public class BTreeFile implements DbFile {
                                        Field f)
 					throws DbException, TransactionAbortedException {
 		// some code goes here
-        return null;
+		// 如果是叶子节点，直接返回
+		if (pid.pgcateg() == BTreePageId.LEAF) {
+			return (BTreeLeafPage) getPage(tid, dirtypages, pid, perm);
+		}
+
+		// 如果是内部节点，READ_ONLY取页，找到对应的子节点继续递归
+		BTreeInternalPage internalPage = (BTreeInternalPage) getPage(tid, dirtypages, pid, Permissions.READ_ONLY);
+
+		BTreePageId childPid = null;
+
+		if (f == null) {
+			// 如果 f == null，每次都递归往最左子节点走
+			// 取第一个entry，然后往左子节点走
+			Iterator<BTreeEntry> it = internalPage.iterator();
+			if (!it.hasNext()) {
+				throw new DbException("Internal page has no entries");
+			}
+			BTreeEntry firstEntry = it.next();
+			childPid = firstEntry.getLeftChild();
+			return findLeafPage(tid, dirtypages, childPid, perm, f);
+		}
+		else{
+			Iterator<BTreeEntry> it = internalPage.iterator();
+			BTreeEntry prev = null;
+
+			while (it.hasNext()) {
+				BTreeEntry entry = it.next();
+				// 如果 f <= entry.key，往左子节点走
+				if (f.compare(Op.LESS_THAN_OR_EQ, entry.getKey())) {
+					childPid = entry.getLeftChild();
+					return findLeafPage(tid, dirtypages, childPid, perm, f);
+				}
+				// 还没命中，更新“当前最右”
+				prev = entry;
+			}
+
+			// 如果 f > 所有entry.key，往最右子节点走
+			if (prev != null) {
+				childPid = prev.getRightChild();
+				return findLeafPage(tid, dirtypages, childPid, perm, f);
+			}
+		}
+		return null;
 	}
 	
 	/**
@@ -239,8 +281,75 @@ public class BTreeFile implements DbFile {
 		// the new entry.  getParentWithEmtpySlots() will be useful here.  Don't forget to update
 		// the sibling pointers of all the affected leaf pages.  Return the page into which a 
 		// tuple with the given key field should be inserted.
-        return null;
-		
+
+		// 1. 创建新的空页right
+		BTreeLeafPage right = (BTreeLeafPage) getEmptyPage(tid, dirtypages, BTreePageId.LEAF);
+
+		// 2. 将page的一半tuple搬到right（从左往右）
+		int n = page.getNumTuples();
+		int keep = n / 2;                     // 左页保留的个数（floor）
+		List<Tuple> toMove = new ArrayList<>(n - keep);
+
+		// 2.1 先把迭代器“走到中间”
+		Iterator<Tuple> it = page.iterator();
+		for (int i = 0; i < keep; i++) {
+			if (!it.hasNext()) {
+				throw new DbException("Leaf page has no tuples");
+			}
+			it.next();
+		}
+
+		// 2.2 收集右半部分
+		while (it.hasNext()) {
+			toMove.add(it.next());
+		}
+
+		// 2.3 从page删除右半部分，并插入到right
+		for (Tuple t : toMove) {
+			page.deleteTuple(t);
+			right.insertTuple(t);
+		}
+
+
+		// 3. 取右页的第一个 tuple 的 key 作为分隔键 sepKey
+		Iterator<Tuple> rit = right.iterator();
+		if (!rit.hasNext()) throw new DbException("right page has no tuples");
+		Tuple firstTuple = rit.next();
+		Field sepKey = firstTuple.getField(keyField);
+
+		// 4. 更新左右页的 sibling 指针
+		// 原链： left <-> oldRight
+		// 新链： left <-> right <-> oldRight
+		BTreePageId oldRightId = page.getRightSiblingId();
+		page.setRightSiblingId(right.getId());
+		right.setLeftSiblingId(page.getId());
+		right.setRightSiblingId(oldRightId);
+		// 不能直接oldRight.setLeftSiblingId(right.getId());
+		// 因为你手上只有 oldRight 的 PageId，没有拿到它对应的 Page 实例，而且修改页必须在持有写锁的前提下进行，还要把被修改的页纳入 dirtypages 以便后续刷盘。这三件事都需要通过 getPage(...) 完成。
+		if (oldRightId != null) {
+			BTreeLeafPage oldRight = (BTreeLeafPage) getPage(tid, dirtypages, oldRightId, Permissions.READ_WRITE);
+			oldRight.setLeftSiblingId(right.getId());
+		}
+
+		// 5. 把sepKey copy 到 parent
+		BTreeInternalPage parent = getParentWithEmptySlots(tid, dirtypages, page.getParentId(), sepKey);
+		BTreeEntry up = new BTreeEntry(sepKey, page.getId(), right.getId());
+		parent.insertEntry(up);
+
+		// 6. 更新左右页的 parentId
+		page.setParentId(parent.getId());
+		right.setParentId(parent.getId());
+
+		// 7. 根据插入 key field 决定回哪一页继续插入
+		if (field == null){
+			return page;
+		}
+		if (field.compare(Op.LESS_THAN_OR_EQ, sepKey)) {
+			return page;
+		} else {
+			return right;
+		}
+
 	}
 	
 	/**
@@ -277,7 +386,66 @@ public class BTreeFile implements DbFile {
 		// the parent pointers of all the children moving to the new page.  updateParentPointers()
 		// will be useful here.  Return the page into which an entry with the given key field
 		// should be inserted.
-		return null;
+
+		// 1. 创建新的空页right
+		BTreeInternalPage right = (BTreeInternalPage) getEmptyPage(tid, dirtypages, BTreePageId.INTERNAL);
+
+		// 2. 计算中间entry的位置
+		int midIndex = page.getNumEntries() / 2;
+
+		// 先把迭代器“走到中间”
+		Iterator<BTreeEntry> it = page.iterator();
+		BTreeEntry midEntry = null;
+		for (int i = 0; i < midIndex; i++) {
+			if (!it.hasNext()) {
+				throw new DbException("Internal page has no entries");
+			}
+			it.next();
+		}
+		if (!it.hasNext()) throw new DbException("mid entry not found");
+		midEntry = it.next();
+		Field midKey = midEntry.getKey();
+
+		// 3. 将midEntry之后的entry移动到right
+		// 收集中位右侧的 entries
+		List<BTreeEntry> toMove = new ArrayList<>(page.getNumEntries() - midIndex);
+		while (it.hasNext()) {
+			toMove.add(it.next());
+		}
+		// 从page删除右半部分，并插入到right
+		for (BTreeEntry entry : toMove) {
+			page.deleteKeyAndRightChild(entry);
+			right.insertEntry(entry);
+		}
+
+		// 4. 从left删除midEntry
+		page.deleteKeyAndRightChild(midEntry);
+
+		// 5. 更新所有被移动到right的child的parent指针
+		updateParentPointers(tid, dirtypages, right);
+
+		// 6. 把midEntry push up到parent
+		BTreeInternalPage parent = getParentWithEmptySlots(tid, dirtypages, page.getParentId(), midKey);
+		BTreeEntry up = new BTreeEntry(midKey, page.getId(), right.getId());
+		parent.insertEntry(up);
+
+		// 7. 更新左右页的parentId
+		page.setParentId(parent.getId());
+		right.setParentId(parent.getId());
+
+		// 8. 根据插入 key field 决定回哪一页继续插入
+		if (field == null){
+			return page;
+		}
+		if (field.compare(Op.LESS_THAN_OR_EQ, midKey)) {
+			return page;
+		} else {
+			return right;
+		}
+
+		// 9. 把所有修改过的页放到 dirtypages
+		// 已由 getEmptyPage() 和 getParentWithEmptySlots() 完成
+
 	}
 	
 	/**
@@ -555,7 +723,7 @@ public class BTreeFile implements DbFile {
 	 * tuple in the right-hand page.
 	 * 
 	 * @param page - the leaf page which is less than half full
-	 * @param sibling - the sibling which has tuples to spare
+	 * @param sibling - the sibling which has tuples to spare 有多余 tuple，可以出借的一方
 	 * @param parent - the parent of the two leaf pages
 	 * @param entry - the entry in the parent pointing to the two leaf pages
 	 * @param isRightSibling - whether the sibling is a right-sibling
@@ -569,6 +737,59 @@ public class BTreeFile implements DbFile {
         // Move some of the tuples from the sibling to the page so
 		// that the tuples are evenly distributed. Be sure to update
 		// the corresponding parent entry.
+
+		// 1. 计算要搬多少个 tuple
+		int total = page.getNumTuples() + sibling.getNumTuples();
+		int move = total / 2 - page.getNumTuples();  // 向下取整
+		if (move <= 0) return; // 不需要搬
+
+		// 2. 搬 tuple
+		List<Tuple> toMove = new ArrayList<>(move);
+		if (isRightSibling) {
+			// 从右兄弟搬 move 个 tuple 过来
+			Iterator<Tuple> it = sibling.iterator();
+			for (int i = 0; i < move; i++) {
+				if (!it.hasNext()) {
+					throw new DbException("Right sibling has no tuples");
+				}
+				toMove.add(it.next());
+			}
+			// 删除并插入
+			for (Tuple t : toMove) {
+				sibling.deleteTuple(t);
+				page.insertTuple(t);
+			}
+			// 父 key = 右页（sibling）首 tuple 的 key
+			Iterator<Tuple> pit = sibling.iterator();
+			if (!pit.hasNext()) throw new DbException("Right sibling unexpectedly empty after steal");
+			Tuple firstRight = pit.next();
+			entry.setKey(firstRight.getField(keyField()));
+			parent.updateEntry(entry);
+
+		}
+		// 从左兄弟搬 move 个 tuple 过来
+		else {
+			// 用 reverse iterator
+			Iterator<Tuple> rit = sibling.reverseIterator();
+			for (int i = 0; i < move; i++) {
+				if (!rit.hasNext()) {
+					throw new DbException("Left sibling has no tuples");
+				}
+				toMove.add(rit.next());
+			}
+			// 删除并插入
+			for (Tuple t : toMove) {
+				sibling.deleteTuple(t);
+				page.insertTuple(t);
+			}
+			// 父 key = 右页（page）首 tuple 的 key
+			Iterator<Tuple> pit = page.iterator();
+			if (!pit.hasNext()) throw new DbException("Page unexpectedly empty after steal");
+			Tuple firstRight = pit.next();
+			entry.setKey(firstRight.getField(keyField()));
+			parent.updateEntry(entry);
+
+		}
 	}
 
 	/**
@@ -648,6 +869,46 @@ public class BTreeFile implements DbFile {
 		// that the entries are evenly distributed. Be sure to update
 		// the corresponding parent entry. Be sure to update the parent
 		// pointers of all children in the entries that were moved.
+
+		// 1. 计算要搬多少个 entry
+		int total = page.getNumEntries() + leftSibling.getNumEntries();
+		int move = total / 2 - page.getNumEntries();  // 向下取整
+		if (move <= 0) return; // 不需要搬
+
+		for (int i = 0; i < move; i++) {
+			// 2. 暂存父键（将被“下沉”到右页）
+			Field tempKey = parentEntry.getKey();
+
+			// 3. 拿值再删左兄弟最大 entry（eL）
+			Iterator<BTreeEntry> lit = leftSibling.reverseIterator();
+			if (!lit.hasNext()) {
+				throw new DbException("Left sibling has no entries");
+			}
+			BTreeEntry eL = lit.next();
+			leftSibling.deleteKeyAndRightChild(eL);
+
+			// 4. 父key下放
+			// 得到右边第一个key的leftChild指针
+			Iterator<BTreeEntry> pit = page.iterator();
+			if (!pit.hasNext()) {
+				throw new DbException("Page has no entries");
+			}
+			BTreeEntry firstRight = pit.next();
+			// 新建downEntry
+			BTreeEntry downEntry = new BTreeEntry(tempKey, eL.getRightChild(), firstRight.getLeftChild());
+			// 插入到右页
+			page.insertEntry(downEntry);
+
+
+			// 5. 更新parent
+			parentEntry.setKey(eL.getKey()); // 只是把这个 entry 的 key 改了
+			parent.updateEntry(parentEntry); // 把上面改动真正写回页面（同步到 BTreeInternalPage）
+
+		}
+
+		// 6. 更新所有被移动到right的child的parent指针
+		// 让右页所有子节点的 parentId 指向 page 自己
+		updateParentPointers(tid, dirtypages, page);
 	}
 	
 	/**
@@ -675,6 +936,47 @@ public class BTreeFile implements DbFile {
 		// that the entries are evenly distributed. Be sure to update
 		// the corresponding parent entry. Be sure to update the parent
 		// pointers of all children in the entries that were moved.
+
+		// 1. 计算要搬多少个 entry
+		int total = page.getNumEntries() + rightSibling.getNumEntries();
+		int move = total / 2 - page.getNumEntries();  // 向下取整
+		if (move <= 0) return; // 不需要搬
+
+		for (int i = 0; i < move; i++) {
+			// 2. 暂存父键（将被“下沉”到左页）
+			Field tempKey = parentEntry.getKey();
+
+			// 3. 拿值再删右兄弟最小 entry（eR）
+			Iterator<BTreeEntry> rit = rightSibling.iterator();
+			if (!rit.hasNext()) {
+				throw new DbException("Right sibling has no entries");
+			}
+			BTreeEntry eR = rit.next();
+			rightSibling.deleteKeyAndLeftChild(eR);
+
+			// 4. 父key下放
+			// 得到左边最后一个key的rightChild指针
+			Iterator<BTreeEntry> lit = page.reverseIterator();
+			if (!lit.hasNext()) {
+				throw new DbException("Page has no entries");
+			}
+			BTreeEntry LastLeft = lit.next();
+			// 新建downEntry
+			BTreeEntry downEntry = new BTreeEntry(tempKey, LastLeft.getRightChild(), eR.getLeftChild());
+			// 插入到左页
+			page.insertEntry(downEntry);
+
+
+			// 5. 更新parent
+			parentEntry.setKey(eR.getKey()); // 只是把这个 entry 的 key 改了
+			parent.updateEntry(parentEntry); // 把上面改动真正写回页面（同步到 BTreeInternalPage）
+
+		}
+
+		// 6. 更新所有被移动到right的child的parent指针
+		// 让左页所有子节点的 parentId 指向 page 自己
+		updateParentPointers(tid, dirtypages, page);
+
 	}
 	
 	/**
@@ -705,6 +1007,33 @@ public class BTreeFile implements DbFile {
 		// the sibling pointers, and make the right page available for reuse.
 		// Delete the entry in the parent corresponding to the two pages that are merging -
 		// deleteParentEntry() will be useful here
+
+		// 1. 把 rightPage 的所有 tuple 挪到 leftPage
+		List<Tuple> toMerge = new ArrayList<>();
+		Iterator<Tuple> it = rightPage.iterator();
+		while (it.hasNext()) {
+			toMerge.add(it.next());
+		}
+		for (Tuple t : toMerge) {
+			rightPage.deleteTuple(t);
+			leftPage.insertTuple(t);
+		}
+
+		// 2. 更新 sibling pointers
+		leftPage.setRightSiblingId(rightPage.getRightSiblingId());
+		if (rightPage.getRightSiblingId() != null) {
+			// 得到 rightPage 的右兄弟
+			BTreeLeafPage rightSibling = (BTreeLeafPage) getPage(tid, dirtypages, rightPage.getRightSiblingId(), Permissions.READ_WRITE);
+			// 让 rightSibling 的左兄弟指向 leftPage
+			rightSibling.setLeftSiblingId(leftPage.getId());
+		}
+
+		// 3. 回收rightPage
+		setEmptyPage(tid, dirtypages, rightPage.getId().getPageNumber());
+
+		// 4. 删除 parentEntry
+		deleteParentEntry(tid, dirtypages, leftPage, parent, parentEntry);
+
 	}
 
 	/**
@@ -738,6 +1067,44 @@ public class BTreeFile implements DbFile {
 		// and make the right page available for reuse
 		// Delete the entry in the parent corresponding to the two pages that are merging -
 		// deleteParentEntry() will be useful here
+
+		// 1. 把 parentEntry 的 key 下放到 leftPage
+		// 得到 leftPage 的最后一个 entry 的 rightChild 指针
+		Iterator<BTreeEntry> lit = leftPage.reverseIterator();
+		if (!lit.hasNext()) {
+			throw new DbException("Left page has no entries");
+		}
+		BTreeEntry lastLeft = lit.next();
+		// 得到 rightPage 的第一个 entry 的 leftChild 指针
+		Iterator<BTreeEntry> rit = rightPage.iterator();
+		if (!rit.hasNext()) {
+			throw new DbException("Right page has no entries");
+		}
+		BTreeEntry firstRight = rit.next();
+		// 新建 downEntry
+		BTreeEntry downEntry = new BTreeEntry(parentEntry.getKey(), lastLeft.getRightChild(), firstRight.getLeftChild());
+		// 插入到 leftPage
+		leftPage.insertEntry(downEntry);
+
+		// 2. 把 rightPage 的所有 entry 挪到 leftPage
+		List<BTreeEntry> toMerge = new ArrayList<>();
+		Iterator<BTreeEntry> pit = rightPage.iterator();
+		while (pit.hasNext()) {
+			toMerge.add(pit.next());
+		}
+		for (BTreeEntry t : toMerge) {
+			rightPage.deleteKeyAndLeftChild(t);
+			leftPage.insertEntry(t);
+		}
+
+		// 3. 更新所有被移动到 left 的 child 的 parent 指针
+		updateParentPointers(tid, dirtypages, leftPage);
+
+		// 4. 回收 rightPage
+		setEmptyPage(tid, dirtypages, rightPage.getId().getPageNumber());
+
+		// 5. 删除 parentEntry
+		deleteParentEntry(tid, dirtypages, leftPage, parent, parentEntry);
 	}
 	
 	/**

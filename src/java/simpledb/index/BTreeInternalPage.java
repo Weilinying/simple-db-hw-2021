@@ -30,6 +30,7 @@ public class BTreeInternalPage extends BTreePage {
 	
 	private int childCategory; // either leaf or internal
 
+	// 验证当前 B+ 树内部节点（BTreeInternalPage）是否满足结构合法性要求
 	public void checkRep(Field lowerBound, Field upperBound, boolean checkOccupancy, int depth) {
 		Field prev = lowerBound;
 		assert(this.getId().pgcateg() == BTreePageId.INTERNAL);
