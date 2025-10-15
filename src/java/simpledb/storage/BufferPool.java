@@ -170,6 +170,10 @@ public class BufferPool {
                             flushPage(pid);
                             // 标记干净，不需要，flushPage里已经实现
                             // page.markDirty(false, null);
+
+                            // use current page contents as the before-image
+                            // for the next transaction that modifies this page.
+                            page.setBeforeImage();
                         } else {
                             // 回滚：换成旧版本
                             Page beforeImage = page.getBeforeImage();
@@ -295,6 +299,13 @@ public class BufferPool {
         if (page.isDirty() != null) {
             // Get the DbFile that contains this page
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+            // append an update record to the log, with
+            // a before-image and after-image.
+            TransactionId dirtier = page.isDirty();
+            if (dirtier != null){
+                Database.getLogFile().logWrite(dirtier, page.getBeforeImage(), page);
+                Database.getLogFile().force();
+            }
             // 写回磁盘
             dbFile.writePage(page);
             // // 清除脏标记
