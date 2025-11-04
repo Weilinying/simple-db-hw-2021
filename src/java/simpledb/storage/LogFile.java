@@ -460,7 +460,70 @@ public class LogFile {
             synchronized(this) {
                 preAppend();
                 // some code goes here
+
+                // 1. 找到该事务在日志文件里的起点
+                Long logStart = tidToFirstLogRecord.get(tid.getId());
+                if (logStart == null) {
+                    // 这个事务可能没写过 UPDATE，或没 BEGIN 过；直接返回即可
+                    return;
+                }
+
+                // 2. 得到这个事务写过的所有 UPDATE 的 before-image（正向扫描）
+                List<Page> befores = new ArrayList<>();
+                // 让接下来的读写操作从文件第 logStart 个字节处开始
+                raf.seek(logStart);
+                try {
+                    while (true){
+                        int type = raf.readInt(); // 记录类型
+                        long record_tid = raf.readLong(); // 记录所属事务 id
+
+                        if (type == UPDATE_RECORD) {
+                            // UPDATE: [type][tid][before][after][startOfRecord]
+                            // 读出 before/after，两者都会前进文件指针
+                            Page before = readPageData(raf); // before-image
+                            Page after = readPageData(raf); // after-image（rollback不需要，但必须读出来推进指针）
+                            long _recStart = raf.readLong(); // 读出startOfRecord（rollback不需要，但必须读出来推进指针），这个和raf.readLong()作用一样，只是会在recover中用于反向扫描
+
+                            if (record_tid == tid.getId()) {
+                                // 只收集属于该事务的 UPDATE 的 before-image
+                                befores.add(before);
+                            }
+                        }
+                        else if (type == CHECKPOINT_RECORD) {
+                            // CHECKPOINT: [type][tid][n][(tid,firstOffset)*n][startOfRecord]，格式跟别的不一样
+                            int n = raf.readInt(); // 读出活跃事务数量 n
+                            for (int i = 0; i < n; i++) {
+                                raf.readLong(); // 读出活跃事务 id（rollback不需要，但必须读出来推进指针）
+                                raf.readLong(); // 读出活跃事务的 firstOffset（rollback不需要，但必须读出来推进指针）
+                            }
+                            raf.readLong(); // 读出startOfRecord（rollback不需要，但必须读出来推进指针）
+                        }
+                        else{
+                            // BEGIN/COMMIT/ABORT 等：格式都是 [type][tid][startOfRecord]
+                            raf.readLong(); // 读出startOfRecord（rollback不需要，但必须读出来推进指针）
+                        }
+                    }
+                }
+                catch (EOFException e) {
+                    // 读到文件末尾就停
+                }
+
+                // 3. 反向写回这些 before-image
+                for (int i = befores.size() - 1; i >= 0; i--) {
+                    Page before = befores.get(i);
+                    PageId pid = before.getId();
+
+                    // 覆盖磁盘页（物理 UNDO）
+                    Database.getCatalog().getDatabaseFile(pid.getTableId()).writePage(before);
+
+                    // 丢掉缓冲池里的该页，避免旧脏页再次刷盘覆盖回滚结果
+                    Database.getBufferPool().discardPage(pid);
+                }
             }
+
+
+
+
         }
     }
 
@@ -487,6 +550,176 @@ public class LogFile {
             synchronized (this) {
                 recoveryUndecided = false;
                 // some code goes here
+
+                // 0. 数据结构
+                // winners: 明确 COMMIT 的事务
+                final Set<Long> winners = new HashSet<>();
+                // losers: 扫描结束时仍未 COMMIT/ABORT 的事务
+                final Set<Long> losers  = new HashSet<>();
+
+                // 为了执行“先 UNDO 后 REDO”，我们缓存各事务遇到的 UPDATE 的前/后镜像
+                final Map<Long, List<Page>> beforePagesByTid = new HashMap<>();
+                final Map<Long, List<Page>> afterPagesByTid  = new HashMap<>();
+
+                // 1. 找到最后一个 CHECKPOINT 位置
+                raf.seek(0);
+                long checkpointOffset = raf.readLong();
+
+                // 我们要计算真正的 REDO 起点 startPos：
+                //  - 没有 checkpoint：从 LONG_SIZE(=8) 开始；
+                //  - 有 checkpoint：如果 checkpoint 时活跃事务数 > 0，
+                //      从这些活跃事务的 firstLogRecord 的最小值开始；
+                //    否则（活跃数 == 0），从 checkpoint 记录本身开始。
+                long startPos;
+
+                if (checkpointOffset == NO_CHECKPOINT_ID) {
+                    // 没有 checkpoint => 从文件头后面 8 字节开始（跳过“checkpoint 指针”）
+                    startPos = LONG_SIZE;
+                }
+                else{
+                    // 有checkpoint => 先从 checkpointOffset 处读出活跃事务列表
+                    raf.seek(checkpointOffset);
+
+                    int type = raf.readInt(); // 理论上应该 == CHECKPOINT_RECORD
+                    raf.readLong(); // 跳过 tid 占位符
+                    int n = raf.readInt(); // 活跃事务数
+
+                    long minFirst = Long.MAX_VALUE;   // 用来找“最早的 firstLogRecord”
+
+                    for (int i = 0; i < n; i++) {
+                        long activeTid = raf.readLong();     // 活跃事务 id
+                        long firstLogRecord = raf.readLong(); // 该事务的 firstLogRecord
+
+                        // 这些事务在 checkpoint 时刻是活跃的，先假设是“loser”，
+                        // 后续正向扫描时遇到 COMMIT/ABORT 再把它们从 losers 移除。
+                        losers.add(activeTid);
+
+                        // rollback 需要 firstLogRecord：补齐到 tidToFirstLogRecord
+                        tidToFirstLogRecord.put(activeTid, firstLogRecord);
+
+                        // 用于计算 REDO 的真实起点（防止漏掉 checkpoint 之前的 UPDATE）
+                        if (firstLogRecord < minFirst) {
+                            minFirst = firstLogRecord;
+                        }
+
+
+                    }
+                    raf.readLong(); // 跳过 checkpoint 记录末尾的 startOffset
+
+                    // 计算 REDO 起点
+                    if (n > 0) {
+                        // 活跃事务数 > 0，从它们的 firstLogRecord 里选最早的
+                        startPos = Math.min(checkpointOffset, minFirst);
+                    }
+                    else {
+                        // 活跃事务数 == 0，从 checkpoint 记录本身开始
+                        startPos = checkpointOffset;
+                    }
+
+                }
+
+                // 2. 正向扫描
+                raf.seek(startPos);
+                while (true) {
+                    try {
+                        int type = raf.readInt(); // 记录类型
+                        long tid = raf.readLong(); // 记录所属事务id
+
+                        switch (type) {
+                            case UPDATE_RECORD:{
+                                // UPDATE: [type][tid][before][after][startOfRecord]
+                                Page before = readPageData(raf); // before-image（redo不需要，但必须读出来推进指针）
+                                Page after = readPageData(raf); // after-image
+                                beforePagesByTid
+                                        .computeIfAbsent(tid, k -> new ArrayList<>())
+                                        .add(before);
+                                afterPagesByTid
+                                        .computeIfAbsent(tid, k -> new ArrayList<>())
+                                        .add(after);
+
+                                raf.readLong(); // 读出startOfRecord（redo不需要，但必须读出来推进指针）
+                                break;
+                            }
+                            case BEGIN_RECORD:{
+                                // BEGIN: [type][tid][startOfRecord]
+                                long beginStartOffset = raf.readLong(); // 这条记录自身起点，也正是该事务的 firstOffset
+                                losers.add(tid); // BEGIN 的事务先假设是“loser”，后续遇到 COMMIT/ABORT 再移除
+
+                                // 若之前没从 checkpoint 拿到 firstOffset，就用 BEGIN 的起点补齐
+                                tidToFirstLogRecord.putIfAbsent(tid, beginStartOffset);
+                                break;
+                            }
+                            case COMMIT_RECORD:{
+                                // COMMIT: [type][tid][startOfRecord]
+                                raf.readLong(); // 读出startOfRecord（redo不需要，但必须读出来推进指针）
+                                winners.add(tid); // 明确 COMMIT 的事务
+                                losers.remove(tid); // 不再是“未完成”
+                                break;
+                            }
+                            case ABORT_RECORD:{
+                                // ABORT: [type][tid][startOfRecord]
+                                raf.readLong(); // 读出startOfRecord（redo不需要，但必须读出来推进指针）
+                                // 明确 ABORT 的事务不加入 winners
+                                losers.remove(tid); // 不再是“未完成”
+                                break;
+                            }
+                            case CHECKPOINT_RECORD:{
+                                // CHECKPOINT: [type][tid][n][(tid,firstOffset)*n
+                                raf.readLong(); // 跳过占位 tid
+                                int n = raf.readInt(); // 读出活跃事务数量 n
+                                for (int i = 0; i < n; i++) {
+                                    long t = raf.readLong(); // 读出活跃事务 id（redo不需要，但必须读出来推进指针）
+                                    long first = raf.readLong(); // 读出活跃事务的 firstOffset（redo不需要，但必须读出来推进指针）
+                                    // 如果我们之前还没记录过某个事务的起始位置，就可以从这个 checkpoint 里“补齐”
+                                    tidToFirstLogRecord.putIfAbsent(t, first);
+                                }
+                                raf.readLong(); // 读出startOfRecord（redo不需要，但必须读出来推进指针）
+                                break;
+                            }
+                        }
+                    }catch (EOFException eof) {
+                        // 到达文件末尾，第一趟扫描结束
+                        break;
+                    }
+                }
+
+                // 4. REDO winners
+                for (Long winnerTid : winners) {
+                    List<Page> afters = afterPagesByTid.get(winnerTid);
+                    if (afters == null || afters.isEmpty()) continue;
+                    // 正序写回这些 after-image
+                    for (Page after : afters) {
+                        PageId pid = after.getId();
+                        // 覆盖磁盘页（物理 REDO）
+                        Database.getCatalog().getDatabaseFile(pid.getTableId()).writePage(after);
+                        // 丢掉缓冲池里的该页，避免旧脏页再次刷盘覆盖回滚结果
+                        Database.getBufferPool().discardPage(pid);
+                    }
+                }
+
+                // 3. UNDO losers
+                for (Long loserTid : losers) {
+                    List<Page> befores = beforePagesByTid.get(loserTid);
+                    if (befores == null || befores.isEmpty()) continue;
+
+                    // 逆序写回这些 before-image
+                    for (int i = befores.size() - 1; i >= 0; i--) {
+                        Page before = befores.get(i);
+                        PageId pid = before.getId();
+                        // 覆盖磁盘页（物理 UNDO）
+                        Database.getCatalog().getDatabaseFile(pid.getTableId()).writePage(before);
+                        // 丢掉缓冲池里的该页，避免旧脏页再次刷盘覆盖回滚结果
+                        Database.getBufferPool().discardPage(pid);
+                    }
+                }
+
+
+
+                System.out.println("startPos = " + startPos);
+                System.out.println("winners = " + winners);
+                System.out.println("losers = " + losers);
+                System.out.println("beforePagesByTid = " + beforePagesByTid.keySet());
+                System.out.println("afterPagesByTid = " + afterPagesByTid.keySet());
             }
          }
     }

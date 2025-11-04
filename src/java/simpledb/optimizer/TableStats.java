@@ -4,7 +4,9 @@ import simpledb.common.Database;
 import simpledb.common.DbException;
 import simpledb.common.Type;
 import simpledb.execution.Predicate;
+import simpledb.execution.SeqScan;
 import simpledb.storage.*;
+import simpledb.transaction.Transaction;
 import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
 
@@ -58,7 +60,7 @@ public class TableStats {
             try {
                 TableStats s = new TableStats(tableid, IOCOSTPERPAGE);
                 setTableStats(Database.getCatalog().getTableName(tableid), s);
-            } catch (Exception e) {
+            } catch (TransactionAbortedException | DbException e) {
                 e.printStackTrace();
             }
         }
@@ -98,7 +100,7 @@ public class TableStats {
      *            The cost per page of IO. This doesn't differentiate between
      *            sequential-scan IO and disk seeks.
      */
-    public TableStats(int tableid, int ioCostPerPage) {
+    public TableStats(int tableid, int ioCostPerPage) throws TransactionAbortedException, DbException {
         // For this function, you'll have to get the
         // DbFile for the table in question,
         // then scan through its tuples and calculate
@@ -183,8 +185,6 @@ public class TableStats {
                     }
                 }
             }
-        } catch (DbException | TransactionAbortedException e) {
-            throw new RuntimeException(e);
         } finally {
             try { it.close(); } catch (Exception ignored) {}
         }
@@ -260,7 +260,7 @@ public class TableStats {
         } else {
             StringHistogram hist = stringHists.get(field);
             if (hist != null) {
-                // 直接调用 StringHistogram 的 方法
+                // 直接调用 StringHistogram 的方法
                 return hist.avgSelectivity();
             }
         }
